@@ -1,0 +1,996 @@
+import argparse
+import json
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from src.agents.correlation.correlation_agent import (
+    CorrelationAgent,
+    LogEvent as CorrelationLogEvent,
+)
+from src.agents.log_analyzer import ReasoningAgent
+from src.agents.orchestrator_agent import run_source_agents
+from src.agents.source_adapters import (
+    analyze_apache_events,
+    analyze_auth_events,
+    analyze_linux_events,
+    analyze_openstack_events,
+)
+from src.common import load_logs
+from src.core.client import create_client
+from src.core.config import (
+    BEDROCK_CHUNK_MODEL,
+    BEDROCK_CHUNK_MODEL_ID,
+    BEDROCK_MODEL,
+    BEDROCK_REGION,
+    CORRELATION_TIMEOUT_SECONDS,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CHUNK_STRATEGY,
+    DEFAULT_CORRELATION_SELECTION,
+    DEFAULT_LANE_MAX_CHUNKS,
+    DEFAULT_MAX_LINES,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_PROVIDER,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TIMEOUT_SECONDS,
+    GROQ_API_KEY,
+    GROQ_CHUNK_SIZE,
+    GROQ_MODEL,
+    MAX_FACTS_BLOCK_LINES,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MODEL,
+    OPENROUTER_MODEL_CANDIDATES,
+    RETRIEVAL_CONTEXT,
+    RETRIEVAL_TOP_K,
+    bedrock_configured,
+)
+from src.core.correlation_facts import extract_security_facts, format_facts_block
+from src.core.dedup import deduplicate_events
+from src.core.log_event import (
+    LogEvent,
+    build_events,
+    build_events_from_ingestion_records,
+    build_source_name,
+)
+from src.core.log_parser import ParsedLog, chunk_logs, chunk_logs_adaptive, parse_logs
+from src.ingestion.ingest_logs import (
+    DATASET_PATHS,
+    OUTPUT_JSONL,
+    OUTPUT_SUMMARY,
+    compute_summary,
+    load_all_datasets,
+    validate_all_records,
+    write_jsonl,
+    write_summary_json,
+)
+from src.retrieval.rag_context import RetrievalContext
+
+LOW_SIGNAL_MARKERS = (
+    "scheduler_evaluate_activity told me to run this job",
+    "location icon should now be in state",
+)
+DEMO_NORMALIZED_LOG_FILE = (
+    Path(__file__).resolve().parent.parent / "examples" / "demo_unified_logs.jsonl"
+)
+DEFAULT_RAW_LOG_FILE = ""
+
+
+def analysis_report_versioning(stem: str) -> Path:
+    path = Path(stem)
+    base = path.stem if path.suffix.lower() == ".json" else path.name
+    parent = path.parent
+    n = 1
+    while True:
+        candidate = parent / f"{base}_{n}.json"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def load_log_file(path: str, max_lines: int) -> list[str]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"log file not found: {p}")
+    with p.open("r", encoding="utf-8", errors="replace") as handle:
+        lines = [line for _, line in zip(range(max_lines), handle)]
+    return lines
+
+
+def drop_low_signal_lines(
+    entries: list[ParsedLog],
+    enabled: bool,
+) -> tuple[list[ParsedLog], int]:
+    if not enabled:
+        return entries, 0
+    kept = []
+    dropped = 0
+    for item in entries:
+        message = item.message.lower()
+        if any(marker in message for marker in LOW_SIGNAL_MARKERS):
+            dropped += 1
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
+def available_dataset_paths() -> list[str]:
+    missing = []
+    for path in DATASET_PATHS.values():
+        if not path.exists():
+            missing.append(str(path))
+    return missing
+
+
+def ingest_normalized_logs() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    all_records, per_dataset = load_all_datasets(DATASET_PATHS)
+    validate_all_records(all_records)
+    all_records.sort(key=lambda record: record["timestamp_epoch"])
+
+    write_jsonl(all_records, OUTPUT_JSONL)
+    summary = compute_summary(all_records, per_dataset)
+    write_summary_json(summary, OUTPUT_SUMMARY)
+    return all_records, summary
+
+
+def load_normalized_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"normalized log file not found: {path}")
+    return load_logs(path)
+
+
+def prepare_pipeline_inputs(
+    *,
+    log_file: str,
+    normalized_log_file: str,
+    max_lines: int,
+    drop_low_signal: bool,
+    ingest_if_needed: bool,
+) -> tuple[list[LogEvent], dict[str, Any], list[dict[str, Any]] | None]:
+    normalized_path = Path(normalized_log_file)
+    raw_path = Path(log_file) if log_file else None
+
+    if normalized_path.exists():
+        records = load_normalized_records(normalized_path)
+        if max_lines and len(records) > max_lines:
+            records = records[:max_lines]
+        events, rejected = build_events_from_ingestion_records(records)
+        if not events:
+            raise RuntimeError("normalized log file did not contain any usable events")
+        return events, {
+            "input_mode": "normalized_jsonl",
+            "input_path": str(normalized_path.resolve()),
+            "normalized_record_count": len(records),
+            "event_count": len(events),
+            "rejected_record_count": len(rejected),
+            "rejected_examples": rejected[:20],
+        }, records
+
+    if ingest_if_needed:
+        missing = available_dataset_paths()
+        if not missing:
+            records, ingestion_summary = ingest_normalized_logs()
+            if max_lines and len(records) > max_lines:
+                records = records[:max_lines]
+            events, rejected = build_events_from_ingestion_records(records)
+            if not events:
+                raise RuntimeError("ingestion completed but produced no usable events")
+            return events, {
+                "input_mode": "ingested_datasets",
+                "input_path": str(OUTPUT_JSONL.resolve()),
+                "normalized_record_count": len(records),
+                "event_count": len(events),
+                "rejected_record_count": len(rejected),
+                "rejected_examples": rejected[:20],
+                "ingestion_summary": ingestion_summary,
+            }, records
+
+    if raw_path and raw_path.exists():
+        raw_lines = load_log_file(str(raw_path), max_lines=max_lines)
+        parsed_lines, skipped_lines = parse_logs(raw_lines)
+        parsed_before_filter_count = len(parsed_lines)
+        parsed_lines, dropped_low_signal_count = drop_low_signal_lines(
+            parsed_lines,
+            enabled=drop_low_signal,
+        )
+        if not parsed_lines:
+            raise RuntimeError("No parsable log lines found in input file")
+
+        source = build_source_name(str(raw_path))
+        events = build_events(parsed_lines, source=source)
+        return events, {
+            "input_mode": "raw_log_file",
+            "input_path": str(raw_path.resolve()),
+            "source": source,
+            "raw_line_count": len(raw_lines),
+            "parsed_line_count": parsed_before_filter_count,
+            "parsed_after_filter_count": len(parsed_lines),
+            "skipped_line_count": len(skipped_lines),
+            "dropped_low_signal_count": dropped_low_signal_count,
+            "parser": {
+                "skip_rate": round(len(skipped_lines) / max(1, len(raw_lines)), 4),
+                "skipped_examples": skipped_lines[:20],
+            },
+        }, None
+
+    if DEMO_NORMALIZED_LOG_FILE.exists():
+        missing_datasets = available_dataset_paths()
+        print(
+            "Warning: falling back to the bundled demo fixture because no normalized "
+            "JSONL, ingestible datasets, or raw log file were found. Run "
+            "`python -m src.ingestion.ingest_logs` first for the full LogHub pipeline.",
+            file=sys.stderr,
+        )
+        records = load_normalized_records(DEMO_NORMALIZED_LOG_FILE)
+        if max_lines and len(records) > max_lines:
+            records = records[:max_lines]
+        events, rejected = build_events_from_ingestion_records(records)
+        if not events:
+            raise RuntimeError("bundled demo log file did not contain any usable events")
+        return events, {
+            "input_mode": "bundled_demo",
+            "input_path": str(DEMO_NORMALIZED_LOG_FILE.resolve()),
+            "normalized_record_count": len(records),
+            "event_count": len(events),
+            "rejected_record_count": len(rejected),
+            "rejected_examples": rejected[:20],
+            "missing_dataset_files": missing_datasets,
+            "note": (
+                "No user-provided datasets or raw logs were found, so the pipeline "
+                "fell back to the bundled demo fixture."
+            ),
+        }, records
+
+    missing_datasets = available_dataset_paths()
+    raise RuntimeError(
+        "No usable input found. Checked normalized JSONL at "
+        f"{normalized_path.resolve()}, raw log file at "
+        f"{raw_path.resolve() if raw_path else '<none>'}, and dataset CSVs. "
+        f"Missing dataset files: {missing_datasets[:4]}"
+    )
+
+
+def effective_category_counts(item: dict[str, Any]) -> dict[str, int]:
+    existing = item.get("category_counts") or {}
+    if existing:
+        return dict(existing)
+    counts: Counter = Counter()
+    for ev in item.get("suspicious_events") or []:
+        if isinstance(ev, dict):
+            cat = ev.get("category")
+            if cat:
+                counts[str(cat)] += 1
+    if counts:
+        return dict(sorted(counts.items()))
+    for tf in item.get("top_findings") or []:
+        if isinstance(tf, dict):
+            cat = tf.get("category")
+            if cat:
+                counts[str(cat)] += max(0, int(tf.get("count", 0)))
+    return dict(sorted(counts.items()))
+
+
+def build_chunk_overview(chunk_analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    overview = []
+    for item in chunk_analyses:
+        category_counts = effective_category_counts(item)
+        top_categories = sorted(
+            [{"category": key, "count": value} for key, value in category_counts.items()],
+            key=lambda entry: entry["count"],
+            reverse=True,
+        )[:3]
+        overview.append(
+            {
+                "chunk_id": item.get("chunk_id"),
+                "line_range": [item.get("line_start"), item.get("line_end")],
+                "summary": item.get("summary", ""),
+                "suspicious_event_count": len(item.get("suspicious_events", [])),
+                "top_categories": top_categories,
+            }
+        )
+    return overview
+
+
+def build_overview(correlation: dict[str, Any], totals: dict[str, int]) -> dict[str, Any]:
+    top_categories = sorted(
+        [{"category": key, "count": value} for key, value in totals.items()],
+        key=lambda entry: entry["count"],
+        reverse=True,
+    )[:8]
+    top_correlations = []
+    for item in correlation.get("key_correlations", [])[:5]:
+        top_correlations.append(
+            {
+                "pattern_id": item.get("pattern_id"),
+                "type": item.get("correlation_type"),
+                "confidence": item.get("confidence"),
+                "related_categories": item.get("related_categories", []),
+                "sources": item.get("sources", []),
+                "explanation": item.get("explanation", ""),
+            }
+        )
+    top_hypotheses = []
+    for item in correlation.get("hypotheses", [])[:5]:
+        if isinstance(item, dict):
+            top_hypotheses.append({
+                "hypothesis": item.get("hypothesis", ""),
+                "sources_cited": item.get("sources_cited", []),
+                "confidence": item.get("confidence", 0.0),
+                "benign_alternatives": item.get("benign_alternatives", []),
+                "confidence_level": item.get("confidence_level", ""),
+                "confidence_detail": item.get("confidence_detail", ""),
+                "spurious_risk": item.get("spurious_risk", ""),
+                "spurious_risk_reasoning": item.get("spurious_risk_reasoning", ""),
+                "causal_chain": item.get("causal_chain", []),
+                "red_herrings": item.get("red_herrings", []),
+                "confounding_factors": item.get("confounding_factors", []),
+            })
+        elif isinstance(item, str):
+            top_hypotheses.append({"hypothesis": item})
+    return {
+        "global_summary": correlation.get("global_summary", ""),
+        "top_categories": top_categories,
+        "top_correlations": top_correlations,
+        "hypotheses": top_hypotheses,
+        "timeline_highlights": correlation.get("timeline_highlights", []),
+        "recommended_next_queries": correlation.get("next_queries", []),
+        "red_herrings": correlation.get("red_herrings", []),
+    }
+
+
+def summarize_source_agent_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    by_category = Counter()
+    by_severity = Counter()
+    by_agent = Counter()
+
+    for item in results:
+        by_agent.update([str(item.get("agent", "unknown"))])
+        by_category.update([str(item.get("event_category", "unknown"))])
+        by_severity.update([str(item.get("severity", "unknown"))])
+
+    return {
+        "total_findings": len(results),
+        "by_agent": dict(sorted(by_agent.items())),
+        "by_category": dict(sorted(by_category.items())),
+        "by_severity": dict(sorted(by_severity.items())),
+    }
+
+
+MAX_SOURCE_AGENT_FINDINGS = 20
+SECURITY_MEDIUM_CATEGORIES = frozenset({
+    "repeated_authentication_failure",
+    "invalid_user_attempt",
+    "successful_auth_after_failures",
+    "suspicious_login_burst",
+    "privileged_command",
+    "privilege_or_access_violation",
+    "lifecycle_churn",
+    "apache_access_denied_pattern",
+})
+
+
+def format_source_agent_findings(findings: list[dict[str, Any]]) -> str:
+    selected = []
+    for finding in findings:
+        severity = str(finding.get("severity", "")).upper()
+        category = str(finding.get("event_category", ""))
+        if severity == "HIGH" or (
+            severity == "MEDIUM" and category in SECURITY_MEDIUM_CATEGORIES
+        ):
+            selected.append(finding)
+    if not selected:
+        return ""
+    selected.sort(
+        key=lambda finding: (
+            0 if str(finding.get("severity", "")).upper() == "HIGH" else 1,
+            str(finding.get("start_timestamp", "")),
+            str(finding.get("event_category", "")),
+        )
+    )
+    selected = selected[:MAX_SOURCE_AGENT_FINDINGS]
+    lines = ["Source-agent findings (rule-based, HIGH and MEDIUM security):"]
+    for f in selected:
+        agent = f.get("agent", "unknown")
+        cat = f.get("event_category", "")
+        summary = f.get("summary", "")
+        ts_start = f.get("start_timestamp", "")
+        ts_end = f.get("end_timestamp", "")
+        evidence = f.get("evidence_ids", [])
+        entry = f"- [{agent}] {cat}: {summary}"
+        if ts_start:
+            entry += f" ({ts_start} - {ts_end})"
+        if evidence:
+            entry += f" [evidence: {', '.join(str(e) for e in evidence[:5])}]"
+        lines.append(entry)
+    return "\n".join(lines)
+
+
+def to_correlation_events(events: list[LogEvent]) -> list[CorrelationLogEvent]:
+    converted: list[CorrelationLogEvent] = []
+    for item in events:
+        attributes: dict[str, Any] = {}
+        for entity in item.entities:
+            name = str(entity.get("name", "")).strip()
+            value = entity.get("value")
+            if name and value not in (None, ""):
+                attributes[name] = value
+        for key, value in item.raw_metadata.items():
+            if value in (None, ""):
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                attributes[key] = value
+
+        if item.process:
+            attributes.setdefault("component", item.process)
+            attributes.setdefault("process", item.process)
+        if item.source:
+            attributes.setdefault("dataset", item.source)
+
+        converted.append(
+            CorrelationLogEvent.from_dict(
+                {
+                    "event_id": item.event_id,
+                    "timestamp": item.timestamp,
+                    "source": item.source,
+                    "level": item.severity.upper() if item.severity else "INFO",
+                    "message": item.message,
+                    "attributes": attributes,
+                }
+            )
+        )
+    return converted
+
+
+def build_rule_correlation_summary(events: list[LogEvent]) -> dict[str, Any]:
+    correlation_agent = CorrelationAgent(
+        time_window_seconds=120,
+        min_shared_entities=1,
+        use_message_similarity_fallback=True,
+        min_message_similarity=0.84,
+        require_distinct_sources=False,
+    )
+    groups = correlation_agent.correlate(to_correlation_events(events))
+    summarized_groups = []
+    for group in groups:
+        if len(group.events) < 2:
+            continue
+        sources = sorted({event.source for event in group.events})
+        summarized_groups.append(
+            {
+                "group_id": group.group_id,
+                "start_time_utc": group.start_time.isoformat(),
+                "end_time_utc": group.end_time.isoformat(),
+                "event_count": len(group.events),
+                "sources": sources,
+                "reasons": group.reasons,
+                "event_ids": [event.event_id for event in group.events],
+                "sample_messages": [event.message for event in group.events[:3]],
+            }
+        )
+
+    summarized_groups.sort(key=lambda item: item["event_count"], reverse=True)
+    return {
+        "group_count": len(summarized_groups),
+        "top_groups": summarized_groups[:10],
+    }
+
+
+def run_llm_pipeline(
+    *,
+    events: list[LogEvent],
+    provider: str,
+    models: list[str],
+    api_key: str,
+    region: str = "",
+    chunk_size: int,
+    chunk_strategy: str = "adaptive",
+    source_agent_findings: str = "",
+    enable_source_lanes: bool = False,
+    compact_events: bool = True,
+    correlation_selection: str = DEFAULT_CORRELATION_SELECTION,
+    temperature: float,
+    timeout_seconds: int,
+    correlation_timeout_seconds: int = CORRELATION_TIMEOUT_SECONDS,
+    max_retries: int,
+    seed: int | None,
+    concurrency: int = 4,
+    deadline_seconds: int = 0,
+    lane_max_chunks: int = DEFAULT_LANE_MAX_CHUNKS,
+) -> dict[str, Any]:
+    deduplicated_events = deduplicate_events(events)
+    if chunk_strategy == "adaptive":
+        chunks = chunk_logs_adaptive(deduplicated_events, chunk_size=chunk_size)
+    else:
+        chunks = chunk_logs(deduplicated_events, chunk_size=chunk_size)
+    retrieval_context = (
+        RetrievalContext.load() if RETRIEVAL_CONTEXT and RETRIEVAL_TOP_K > 0 else None
+    )
+    allowed_ids: set[str] | None = None
+    if retrieval_context is not None:
+        allowed_ids = {
+            str(e.raw_metadata.get("line_id", "")).strip()
+            for e in deduplicated_events
+        } - {""}
+        if not allowed_ids:
+            allowed_ids = None
+    llm = create_client(
+        provider=provider,
+        models=models,
+        chunk_model=(
+            BEDROCK_CHUNK_MODEL
+            if provider == "bedrock" and BEDROCK_CHUNK_MODEL_ID
+            else ""
+        ),
+        api_key=api_key,
+        region=region,
+        temperature=temperature,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+        correlation_timeout_seconds=correlation_timeout_seconds,
+    )
+    agent = ReasoningAgent(llm)
+    pipeline_t0 = datetime.now(timezone.utc)
+    deadline_at = (
+        time.monotonic() + deadline_seconds
+        if deadline_seconds > 0
+        else None
+    )
+
+    def remaining_budget() -> float | None:
+        if deadline_at is None:
+            return None
+        left = deadline_at - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"LLM pipeline deadline ({deadline_seconds}s) exceeded")
+        return left
+
+    def _analyze_one_chunk(chunk_id: int, chunk: list[LogEvent]) -> tuple[int, dict]:
+        chunk_seed = None if seed is None else seed + chunk_id
+        retrieval_suffix = ""
+        if retrieval_context is not None:
+            retrieval_suffix = retrieval_context.build_chunk_suffix(
+                chunk,
+                top_k=RETRIEVAL_TOP_K,
+                allowed_ids=allowed_ids,
+            )
+        result = agent.analyze_chunk(
+            chunk_id=chunk_id,
+            entries=chunk,
+            seed=chunk_seed,
+            extra_user_suffix=retrieval_suffix,
+            compact_events=compact_events,
+            include_retrieval=retrieval_context is not None,
+        )
+        return chunk_id, result
+
+    num_chunks = len(chunks)
+    chunk_pool = ThreadPoolExecutor(max_workers=concurrency)
+    chunk_futures = {
+        chunk_pool.submit(_analyze_one_chunk, cid, chunk): cid
+        for cid, chunk in enumerate(chunks, start=1)
+    }
+    try:
+        chunk_results: dict[int, dict] = {}
+        for future in as_completed(chunk_futures, timeout=remaining_budget()):
+            cid = chunk_futures[future]
+            chunk_results[cid] = future.result()[1]
+        chunk_analyses = [chunk_results[cid] for cid in sorted(chunk_results)]
+    except TimeoutError:
+        chunk_pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        chunk_pool.shutdown(wait=True)
+
+    source_scoped = {}
+    lane_call_counts: dict[str, int] = {}
+    if enable_source_lanes:
+        source_lane_specs = [
+            ("auth", analyze_auth_events, 1000),
+            ("openstack", analyze_openstack_events, 2000),
+            ("linux", analyze_linux_events, 3000),
+            ("apache", analyze_apache_events, 4000),
+        ]
+        lane_pool = ThreadPoolExecutor(max_workers=concurrency)
+        lane_futures = {
+            lane_pool.submit(
+                lane_fn,
+                agent,
+                deduplicated_events,
+                chunk_id=max(id_base, num_chunks + id_base - 999),
+                seed=None if seed is None else seed + id_base,
+                lane_chunk_size=chunk_size,
+                max_chunks=lane_max_chunks,
+                deadline_at=deadline_at,
+                compact_events=compact_events,
+            ): lane_name
+            for lane_name, lane_fn, id_base in source_lane_specs
+        }
+        try:
+            for future in as_completed(lane_futures, timeout=remaining_budget()):
+                lane_name = lane_futures[future]
+                analyses, call_count = future.result()
+                source_scoped[lane_name] = analyses
+                lane_call_counts[lane_name] = call_count
+        except TimeoutError:
+            lane_pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            lane_pool.shutdown(wait=True)
+
+    facts = extract_security_facts(deduplicated_events, max_lines=MAX_FACTS_BLOCK_LINES)
+    facts_block = format_facts_block(
+        facts,
+        total_chunks_shown=len(chunk_analyses),
+        total_chunks_available=len(chunk_analyses),
+    )
+    correlation = agent.correlate(
+        chunk_analyses=chunk_analyses,
+        chunk_events=chunks,
+        source_scoped_analyses=source_scoped or None,
+        source_agent_findings=source_agent_findings,
+        facts_block=facts_block,
+        fact_lines=facts,
+        seed=seed,
+        selection_strategy=correlation_selection,
+    )
+    selection_meta = dict(agent.last_correlation_selection)
+
+    totals = Counter()
+    for item in chunk_analyses:
+        totals.update(effective_category_counts(item))
+
+    totals_dict = dict(sorted(totals.items()))
+    return {
+        "meta": {
+            "provider": provider,
+            "model": llm.model,
+            "model_candidates": models,
+            "chunk_size": chunk_size,
+            "chunk_strategy": chunk_strategy,
+            "temperature": temperature,
+            "seed": seed,
+            "chunk_count": len(chunks),
+            "input_event_count": len(events),
+            "deduplicated_event_count": len(deduplicated_events),
+            "lane_call_counts": lane_call_counts,
+            "total_lane_calls": sum(lane_call_counts.values()),
+            "deadline_seconds": deadline_seconds,
+            "retrieval_context": retrieval_context is not None,
+            "retrieval_top_k": RETRIEVAL_TOP_K if retrieval_context is not None else 0,
+            "correlation_selection_strategy": selection_meta.get("strategy", correlation_selection),
+            "selected_correlation_chunk_ids": selection_meta.get("selected_chunk_ids", []),
+            "correlation_selection_note": selection_meta.get("selection_note", ""),
+            "started_at_utc": pipeline_t0.isoformat(),
+        },
+        "overview": build_overview(correlation=correlation, totals=totals_dict),
+        "inference": llm.get_inference_telemetry(),
+        "chunk_overview": build_chunk_overview(chunk_analyses),
+        "details": {
+            "category_totals_from_chunks": totals_dict,
+            "correlation_report": correlation,
+            "chunk_analyses": chunk_analyses,
+            "source_scoped_chunk_analyses": source_scoped,
+        },
+    }
+
+
+def run(
+    *,
+    log_file: str,
+    normalized_log_file: str,
+    output_file: str,
+    provider: str = "bedrock",
+    models: list[str],
+    api_key: str,
+    region: str = "",
+    chunk_size: int,
+    chunk_strategy: str = "adaptive",
+    max_lines: int,
+    enable_source_lanes: bool = False,
+    compact_events: bool = True,
+    correlation_selection: str = DEFAULT_CORRELATION_SELECTION,
+    concurrency: int = 4,
+    deadline_seconds: int = 0,
+    lane_max_chunks: int = DEFAULT_LANE_MAX_CHUNKS,
+    temperature: float,
+    timeout_seconds: int,
+    correlation_timeout_seconds: int = CORRELATION_TIMEOUT_SECONDS,
+    max_retries: int,
+    seed: int | None,
+    drop_low_signal: bool,
+    ingest_if_needed: bool,
+    skip_llm: bool,
+    strict_llm: bool,
+    provider_ready: bool | None = None,
+    provider_hint: str | None = None,
+) -> dict[str, Any]:
+    events, input_meta, normalized_records = prepare_pipeline_inputs(
+        log_file=log_file,
+        normalized_log_file=normalized_log_file,
+        max_lines=max_lines,
+        drop_low_signal=drop_low_signal,
+        ingest_if_needed=ingest_if_needed,
+    )
+
+    report: dict[str, Any] = {
+        "meta": {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "input_mode": input_meta.get("input_mode"),
+            "input_path": input_meta.get("input_path"),
+            "event_count": len(events),
+        },
+        "input": input_meta,
+        "rule_based_correlation": build_rule_correlation_summary(events),
+    }
+
+    if normalized_records is not None:
+        source_agent_results = run_source_agents(normalized_records)
+        report["source_agents"] = {
+            "summary": summarize_source_agent_results(source_agent_results),
+            "findings": source_agent_results,
+        }
+    else:
+        report["source_agents"] = {
+            "summary": {
+                "total_findings": 0,
+                "by_agent": {},
+                "by_category": {},
+                "by_severity": {},
+            },
+            "findings": [],
+            "note": "Source-specific normalized-data agents were skipped for raw log input.",
+        }
+
+    if skip_llm:
+        report["llm_analysis"] = {
+            "status": "skipped",
+            "reason": "disabled via --skip-llm",
+        }
+    else:
+        if provider_ready is None:
+            if provider == "bedrock":
+                provider_ready = bedrock_configured(models[0] if models else "")
+            else:
+                provider_ready = bool(api_key)
+        if provider_hint is None:
+            if provider == "groq":
+                provider_hint = "groq_demo2_key / GROQ_API_KEY"
+            elif provider == "openrouter":
+                provider_hint = "OPENROUTER_API_KEY"
+            else:
+                provider_hint = (
+                    "BEDROCK_MODEL_ID or AWS_BEDROCK_MODEL_ID, region "
+                    "(BEDROCK_REGION or AWS_REGION), and AWS credentials "
+                    "(env or ~/.aws profile)"
+                )
+
+    if correlation_timeout_seconds < timeout_seconds:
+        print(
+            "Warning: correlation timeout is lower than chunk timeout.",
+            file=sys.stderr,
+        )
+
+    if not skip_llm and not provider_ready:
+        if strict_llm:
+            raise RuntimeError(
+                f"{provider_hint} is not set. Export it in your shell or add it to .env"
+            )
+        report["llm_analysis"] = {
+            "status": "skipped",
+            "reason": f"{provider_hint} is not configured",
+        }
+    elif not skip_llm:
+        source_agent_findings = format_source_agent_findings(
+            report.get("source_agents", {}).get("findings", [])
+        )
+        report["llm_analysis"] = run_llm_pipeline(
+            events=events,
+            provider=provider,
+            models=models,
+            api_key=api_key,
+            region=region,
+            chunk_size=chunk_size,
+            chunk_strategy=chunk_strategy,
+            source_agent_findings=source_agent_findings,
+            enable_source_lanes=enable_source_lanes,
+            compact_events=compact_events,
+            correlation_selection=correlation_selection,
+            concurrency=concurrency,
+            deadline_seconds=deadline_seconds,
+            lane_max_chunks=lane_max_chunks,
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+            correlation_timeout_seconds=correlation_timeout_seconds,
+            max_retries=max_retries,
+            seed=seed,
+        )
+
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Integrated multi-source incident analysis pipeline. Retrieval index "
+            "construction is a separate step."
+        ),
+    )
+    parser.add_argument("--log-file", default=DEFAULT_RAW_LOG_FILE)
+    parser.add_argument("--normalized-log-file", default=str(OUTPUT_JSONL))
+    parser.add_argument("--output-file", default="reports/report.json")
+    parser.add_argument(
+        "--output-stem",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write to PATH_1.json, PATH_2.json, ... (first unused). "
+            "Overrides --output-file. PATH may end with .json (base name is stripped)."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=["bedrock", "groq", "openrouter"],
+        help="LLM provider (default selection: bedrock, then groq, then openrouter).",
+    )
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--chunk-size", type=int, default=None)
+    parser.add_argument(
+        "--chunk-strategy",
+        default=DEFAULT_CHUNK_STRATEGY,
+        choices=["fixed", "adaptive"],
+    )
+    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
+    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--deadline-seconds",
+        type=int,
+        default=0,
+        help="Hard wall-clock limit for the LLM pipeline. 0 = no limit.",
+    )
+    parser.add_argument(
+        "--lane-max-chunks",
+        type=int,
+        default=DEFAULT_LANE_MAX_CHUNKS,
+        help="Max chunk analyses per source lane. 0 = unlimited.",
+    )
+    parser.add_argument(
+        "--enable-source-lanes",
+        action="store_true",
+        help="Run source-scoped LLM lanes in addition to temporal chunk analysis.",
+    )
+    parser.add_argument(
+        "--compact-events",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use compact event formatting for chunk analysis prompts.",
+    )
+    parser.add_argument(
+        "--correlation-selection",
+        default=DEFAULT_CORRELATION_SELECTION,
+        choices=["head", "stratified"],
+        help="How to choose chunk summaries for the final correlation prompt.",
+    )
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--correlation-timeout", type=int, default=CORRELATION_TIMEOUT_SECONDS)
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--drop-low-signal", action="store_true")
+    parser.add_argument(
+        "--skip-ingestion",
+        action="store_true",
+        help="Do not auto-ingest dataset CSVs when normalized JSONL is missing.",
+    )
+    parser.add_argument("--skip-llm", action="store_true")
+    parser.add_argument(
+        "--strict-llm",
+        action="store_true",
+        help="Fail instead of skipping when provider credentials are missing.",
+    )
+    return parser
+
+
+def resolve_provider_settings(
+    provider: str,
+    model_override: str | None,
+) -> tuple[str, list[str], str, str, bool, str]:
+    if provider == "bedrock":
+        model = (model_override or BEDROCK_MODEL).strip()
+        return (
+            model,
+            [model] if model else [],
+            "",
+            BEDROCK_REGION,
+            bedrock_configured(model),
+            (
+                "BEDROCK_MODEL_ID or AWS_BEDROCK_MODEL_ID, region, "
+                "and AWS credentials (env or ~/.aws profile)"
+            ),
+        )
+    if provider == "groq":
+        model = (model_override or GROQ_MODEL).strip()
+        return (
+            model,
+            [model] if model else [],
+            GROQ_API_KEY,
+            "",
+            bool(GROQ_API_KEY),
+            "groq_demo2_key / GROQ_API_KEY",
+        )
+
+    model = (model_override or OPENROUTER_MODEL).strip()
+    models = [model] if model and model != OPENROUTER_MODEL else OPENROUTER_MODEL_CANDIDATES
+    return (
+        model,
+        models,
+        OPENROUTER_API_KEY,
+        "",
+        bool(OPENROUTER_API_KEY),
+        "OPENROUTER_API_KEY",
+    )
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    provider = args.provider
+    model, cli_models, api_key, region, provider_ready, provider_hint = (
+        resolve_provider_settings(provider, args.model)
+    )
+
+    chunk_size = args.chunk_size
+    if chunk_size is None:
+        chunk_size = GROQ_CHUNK_SIZE if provider == "groq" else DEFAULT_CHUNK_SIZE
+
+    output_file = (
+        str(analysis_report_versioning(args.output_stem))
+        if args.output_stem
+        else args.output_file
+    )
+
+    result = run(
+        log_file=args.log_file,
+        normalized_log_file=args.normalized_log_file,
+        output_file=output_file,
+        provider=provider,
+        models=cli_models,
+        api_key=api_key,
+        region=region,
+        chunk_size=chunk_size,
+        chunk_strategy=args.chunk_strategy,
+        max_lines=args.max_lines,
+        concurrency=args.concurrency,
+        deadline_seconds=args.deadline_seconds,
+        lane_max_chunks=args.lane_max_chunks,
+        enable_source_lanes=args.enable_source_lanes,
+        compact_events=args.compact_events,
+        correlation_selection=args.correlation_selection,
+        temperature=args.temperature,
+        timeout_seconds=args.timeout_seconds,
+        correlation_timeout_seconds=args.correlation_timeout,
+        max_retries=args.max_retries,
+        seed=args.seed,
+        drop_low_signal=args.drop_low_signal,
+        ingest_if_needed=not args.skip_ingestion,
+        skip_llm=args.skip_llm,
+        strict_llm=args.strict_llm,
+        provider_ready=provider_ready,
+        provider_hint=provider_hint,
+    )
+    print(f"Wrote report: {output_file}")
+    print(f"Provider: {provider} | Model: {model}")
+    print(f"Input mode: {result['meta']['input_mode']}")
+    print(f"Events analyzed: {result['meta']['event_count']}")
+    llm_status = result.get("llm_analysis", {}).get("status", "completed")
+    print(f"LLM status: {llm_status}")
+    if llm_status == "skipped":
+        reason = result.get("llm_analysis", {}).get("reason", "unknown")
+        print(f"LLM reason: {reason}")
+    if result.get("input", {}).get("note"):
+        print(result["input"]["note"])
