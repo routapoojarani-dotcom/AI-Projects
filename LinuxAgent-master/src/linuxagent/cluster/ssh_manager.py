@@ -1,0 +1,438 @@
+"""Paramiko-backed SSH manager with known_hosts enforcement (R-SEC-03).
+
+Key properties:
+
+- Silent auto-add of unknown host keys is banned; this module uses
+  ``RejectPolicy`` and relies on the caller having populated ``known_hosts``
+  before connection.
+- Connections are pooled per ``(hostname, port, username)`` so repeated
+  commands to the same host reuse one TCP/SSH session.
+- Paramiko is blocking; public methods are async and dispatch work to a
+  manager-owned worker pool so no default executor threads leak across runs.
+- ``execute`` returns the same :class:`ExecutionResult` shape as
+  :mod:`..executors.linux_executor`, so HITL / audit sites can treat local
+  and remote executions uniformly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+import time
+import weakref
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import TypeVar
+
+import paramiko
+
+from ..config.models import ClusterConfig, ClusterHost
+from ..interfaces import ExecutionResult
+from ..telemetry import TelemetryRecorder
+from .remote_command import RemoteCommandError, validate_remote_command
+from .remote_profile import build_remote_execution
+
+logger = logging.getLogger(__name__)
+T = TypeVar("T")
+_CHANNEL_READ_CHUNK_BYTES = 32768
+_SSH_POLL_INTERVAL_SECONDS = 0.05
+
+
+class SSHError(RuntimeError):
+    """Base class for SSH failures surfaced to services."""
+
+
+class SSHUnknownHostError(SSHError):
+    """Host key is not present in ``known_hosts`` and policy is ``RejectPolicy``."""
+
+
+class SSHAuthError(SSHError):
+    """Authentication failed (bad key / user / agent)."""
+
+
+class SSHConnectionError(SSHError):
+    """TCP / transport-level failure before authentication succeeded."""
+
+
+class SSHRemoteCommandError(SSHError):
+    """Command is unsafe for remote shell transport."""
+
+
+class SSHCommandTimeoutError(SSHError):
+    """Remote command did not finish before ``cluster.timeout``."""
+
+
+@dataclass(frozen=True)
+class _RemoteCommandOutput:
+    exit_code: int
+    stdout: bytes
+    stderr: bytes
+
+
+class SSHManager:
+    """Pooled SSH client factory + async ``execute`` helper.
+
+    The manager is safe to share across asyncio tasks; the underlying lock
+    guards only the connection pool dict, not the paramiko clients themselves
+    (paramiko is internally thread-safe for ``exec_command``).
+    """
+
+    def __init__(
+        self,
+        config: ClusterConfig,
+        *,
+        allow_unknown_hosts: bool = False,
+        telemetry: TelemetryRecorder | None = None,
+    ) -> None:
+        self._config = config
+        if allow_unknown_hosts:
+            logger.warning("allow_unknown_hosts is ignored; SSH always uses RejectPolicy")
+        self._telemetry = telemetry
+        self._pool: dict[tuple[str, int, str], paramiko.SSHClient] = {}
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=config.max_workers,
+            thread_name_prefix="linuxagent-ssh",
+        )
+        self._executor_finalizer = weakref.finalize(
+            self,
+            _shutdown_executor,
+            self._executor,
+            False,
+        )
+
+    # -- Lifecycle --------------------------------------------------------
+
+    async def close(self) -> None:
+        """Close every pooled client and stop the blocking SSH worker pool."""
+        self._close_all()
+        if self._executor_finalizer.alive:
+            self._executor_finalizer.detach()
+            _shutdown_executor(self._executor, True)
+
+    def _close_all(self) -> None:
+        with self._lock:
+            for client in self._pool.values():
+                try:
+                    client.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("ignoring close error: %s", exc)
+            self._pool.clear()
+
+    # -- Public API -------------------------------------------------------
+
+    async def execute(
+        self,
+        host: ClusterHost,
+        command: str,
+        *,
+        trace_id: str | None = None,
+    ) -> ExecutionResult:
+        """Run ``command`` on ``host`` and return its result."""
+        try:
+            remote_command = validate_remote_command(command)
+        except RemoteCommandError as exc:
+            raise SSHRemoteCommandError(str(exc)) from exc
+        if self._telemetry is not None and trace_id is not None:
+            with self._telemetry.span(
+                "ssh.execute",
+                trace_id=trace_id,
+                attributes={"host": host.name},
+            ):
+                return await self._run_blocking(self._execute_sync, host, remote_command.raw)
+        return await self._run_blocking(self._execute_sync, host, remote_command.raw)
+
+    async def execute_many(
+        self,
+        hosts: Iterable[ClusterHost],
+        command: str,
+        *,
+        trace_id: str | None = None,
+    ) -> dict[str, ExecutionResult | SSHError]:
+        """Fan out ``command`` across ``hosts`` concurrently, isolating failures."""
+        host_list = list(hosts)
+        try:
+            validate_remote_command(command)
+        except RemoteCommandError as exc:
+            return {host.name: SSHRemoteCommandError(str(exc)) for host in host_list}
+        tasks = [self.execute(host, command, trace_id=trace_id) for host in host_list]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        results: dict[str, ExecutionResult | SSHError] = {}
+        for host, outcome in zip(host_list, gathered, strict=True):
+            if isinstance(outcome, SSHError):
+                results[host.name] = outcome
+            elif isinstance(outcome, BaseException):
+                results[host.name] = SSHError(str(outcome))
+            else:
+                results[host.name] = outcome
+        return results
+
+    # -- Internals --------------------------------------------------------
+
+    def _execute_sync(self, host: ClusterHost, command: str) -> ExecutionResult:
+        try:
+            remote_command = validate_remote_command(command)
+            remote_execution = build_remote_execution(host, remote_command)
+        except RemoteCommandError as exc:
+            raise SSHRemoteCommandError(str(exc)) from exc
+        client = self._get_or_connect(host)
+        start = time.monotonic()
+        # Paramiko sends the command through the remote shell; only the generated
+        # profile wrapper may contain shell operators.
+        try:
+            stdin, stdout, _ = client.exec_command(  # nosec B601
+                remote_execution.shell_command, timeout=self._config.timeout
+            )
+            _close_stdin(stdin)
+            output = _collect_remote_command_output(
+                stdout.channel,
+                host=host,
+                command=command,
+                timeout_seconds=self._config.timeout,
+            )
+        except SSHCommandTimeoutError:
+            self._discard_client(host, client)
+            raise
+        except (EOFError, OSError, paramiko.SSHException) as exc:
+            self._discard_client(host, client)
+            raise SSHConnectionError(f"remote command failed on {host.hostname}: {exc}") from exc
+        duration = time.monotonic() - start
+        return ExecutionResult(
+            command=command,
+            exit_code=output.exit_code,
+            stdout=output.stdout.decode("utf-8", errors="replace"),
+            stderr=output.stderr.decode("utf-8", errors="replace"),
+            duration=duration,
+            remote=remote_execution.with_exit_code(output.exit_code),
+        )
+
+    def _get_or_connect(self, host: ClusterHost) -> paramiko.SSHClient:
+        key = (host.hostname, host.port, host.username)
+        with self._lock:
+            client = self._pool.get(key)
+            if client is not None:
+                if _is_alive(client):
+                    return client
+                try:
+                    client.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("ignoring close error on dead pool entry: %s", exc)
+                del self._pool[key]
+
+            new_client = self._build_client()
+            try:
+                new_client.connect(
+                    hostname=host.hostname,
+                    port=host.port,
+                    username=host.username,
+                    key_filename=str(host.key_filename) if host.key_filename else None,
+                    timeout=self._config.timeout,
+                    allow_agent=True,
+                    look_for_keys=True,
+                )
+            except paramiko.BadHostKeyException as exc:
+                new_client.close()
+                raise SSHUnknownHostError(f"host key mismatch for {host.hostname}: {exc}") from exc
+            except paramiko.AuthenticationException as exc:
+                new_client.close()
+                raise SSHAuthError(
+                    f"authentication failed for {host.username}@{host.hostname}: {exc}"
+                ) from exc
+            except (paramiko.SSHException, OSError) as exc:
+                new_client.close()
+                # paramiko raises SSHException for unknown hosts under RejectPolicy.
+                message = str(exc)
+                if (
+                    "not found in known_hosts" in message
+                    or isinstance(exc, paramiko.SSHException)
+                    and "Server" in message
+                    and "not found" in message
+                ):
+                    raise SSHUnknownHostError(f"unknown host {host.hostname}: {exc}") from exc
+                raise SSHConnectionError(f"failed to connect to {host.hostname}: {exc}") from exc
+
+            self._pool[key] = new_client
+            _enable_keepalive(new_client, timeout_seconds=self._config.timeout)
+            return new_client
+
+    def _build_client(self) -> paramiko.SSHClient:
+        client = paramiko.SSHClient()
+        known_hosts = Path(self._config.known_hosts_path)
+        if known_hosts.is_file():
+            client.load_host_keys(str(known_hosts))
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        return client
+
+    async def _run_blocking(self, func: Callable[..., T], *args: object) -> T:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, partial(func, *args))
+
+    def _discard_client(self, host: ClusterHost, client: paramiko.SSHClient) -> None:
+        key = (host.hostname, host.port, host.username)
+        with self._lock:
+            if self._pool.get(key) is client:
+                del self._pool[key]
+        try:
+            client.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ignoring close error on discarded client: %s", exc)
+
+
+def _is_alive(client: paramiko.SSHClient) -> bool:
+    transport = client.get_transport()
+    return transport is not None and transport.is_active()
+
+
+def _enable_keepalive(client: paramiko.SSHClient, *, timeout_seconds: float) -> None:
+    transport = client.get_transport()
+    if transport is None:
+        return
+    transport.set_keepalive(max(1, int(timeout_seconds / 2)))
+
+
+def _collect_remote_command_output(
+    channel: paramiko.Channel,
+    *,
+    host: ClusterHost,
+    command: str,
+    timeout_seconds: float,
+) -> _RemoteCommandOutput:
+    deadline = time.monotonic() + timeout_seconds
+    stdout = bytearray()
+    stderr = bytearray()
+    while True:
+        drained = _drain_channel(
+            channel,
+            stdout=stdout,
+            stderr=stderr,
+            host=host,
+            command=command,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+        )
+        if channel.exit_status_ready():
+            break
+        _raise_if_deadline_expired(channel, host, command, deadline, timeout_seconds)
+        if not drained:
+            time.sleep(min(_SSH_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+    exit_code = channel.recv_exit_status()
+    _drain_channel(
+        channel,
+        stdout=stdout,
+        stderr=stderr,
+        host=host,
+        command=command,
+        deadline=deadline,
+        timeout_seconds=timeout_seconds,
+    )
+    return _RemoteCommandOutput(exit_code=exit_code, stdout=bytes(stdout), stderr=bytes(stderr))
+
+
+def _drain_channel(
+    channel: paramiko.Channel,
+    *,
+    stdout: bytearray,
+    stderr: bytearray,
+    host: ClusterHost,
+    command: str,
+    deadline: float,
+    timeout_seconds: float,
+) -> bool:
+    drained_stdout = _drain_stdout(
+        channel,
+        stdout,
+        host=host,
+        command=command,
+        deadline=deadline,
+        timeout_seconds=timeout_seconds,
+    )
+    drained_stderr = _drain_stderr(
+        channel,
+        stderr,
+        host=host,
+        command=command,
+        deadline=deadline,
+        timeout_seconds=timeout_seconds,
+    )
+    return drained_stdout or drained_stderr
+
+
+def _drain_stdout(
+    channel: paramiko.Channel,
+    buffer: bytearray,
+    *,
+    host: ClusterHost,
+    command: str,
+    deadline: float,
+    timeout_seconds: float,
+) -> bool:
+    drained = False
+    while channel.recv_ready():
+        chunk = channel.recv(_CHANNEL_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        drained = True
+        _raise_if_deadline_expired(channel, host, command, deadline, timeout_seconds)
+    return drained
+
+
+def _drain_stderr(
+    channel: paramiko.Channel,
+    buffer: bytearray,
+    *,
+    host: ClusterHost,
+    command: str,
+    deadline: float,
+    timeout_seconds: float,
+) -> bool:
+    drained = False
+    while channel.recv_stderr_ready():
+        chunk = channel.recv_stderr(_CHANNEL_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        drained = True
+        _raise_if_deadline_expired(channel, host, command, deadline, timeout_seconds)
+    return drained
+
+
+def _raise_if_deadline_expired(
+    channel: paramiko.Channel,
+    host: ClusterHost,
+    command: str,
+    deadline: float,
+    timeout_seconds: float,
+) -> None:
+    if time.monotonic() < deadline:
+        return
+    _close_channel(channel)
+    raise SSHCommandTimeoutError(
+        f"remote command timed out after {timeout_seconds:g}s on {host.name}: {command!r}"
+    )
+
+
+def _close_stdin(stdin: object) -> None:
+    close = getattr(stdin, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except (EOFError, OSError, paramiko.SSHException) as exc:
+        logger.debug("ignoring remote stdin close error: %s", exc)
+
+
+def _close_channel(channel: paramiko.Channel) -> None:
+    try:
+        channel.close()
+    except (EOFError, OSError, paramiko.SSHException) as exc:
+        logger.debug("ignoring channel close error: %s", exc)
+
+
+def _shutdown_executor(executor: ThreadPoolExecutor, wait: bool) -> None:
+    executor.shutdown(wait=wait, cancel_futures=True)

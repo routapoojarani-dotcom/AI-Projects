@@ -1,0 +1,180 @@
+# TypeScript v5 实验 ReAct 运行时
+
+LinuxAgent 当前生产运行时仍是 Python v4。`ts/` 下的 TypeScript v5 工作线是
+旁路实验 ReAct 运行时：在迁移门禁全部满足前，Python 继续作为行为真源和稳定运行时。
+
+The TypeScript runtime is experimental. Python v4 remains the default release runtime until parity gates pass.
+
+不要把 TypeScript workspace 当成默认 `linuxagent` 运行时。它的作用是让迁移过程
+可度量：每个子系统都要带测试、红线检查和与 Python 的 parity fixture，之后才有资格
+替换 Python 行为。
+LangGraph 是旧 Python runtime 的实现细节；TS 的目标 loop 是
+`@earendil-works/pi-agent-core` 加 LinuxAgent safety kernel。
+
+## 当前范围
+
+TypeScript workspace 目前包含：
+
+| Package | 当前状态 |
+|---|---|
+| `@linuxagent/contracts` | Command plan、file patch plan、policy decision、audit entry、runtime event 的共享 TypeBox schema |
+| `@linuxagent/policy` | token/effective-command 策略引擎，已覆盖初始 Python fixture parity |
+| `@linuxagent/audit` | hash-chained JSONL writer 和 verifier |
+| `@linuxagent/sandbox` | sandbox runner contract、noop runner、fail-closed profile selection |
+| `@linuxagent/executor` | argv 本地执行器和有界输出脱敏 |
+| `@linuxagent/agent-runtime` | 会话权限、审批默认值、tool gate、连接 executor 的 command tool、prompt loader、planner validation、最小 runtime wrapper、tool-result redaction hook、最小 turn runner、remote approval/audit metadata、file patch runtime tool、memory scope model、advisory memory read path 和 pending memory write path |
+| `@linuxagent/tui` | 实验 TUI package shell、chat session、direct command routing、approval selector、confirmation renderer 和 slash router |
+| `@linuxagent/linuxagent-ts` | 实验 CLI package shell |
+| `@linuxagent/ssh` | remote profile validation、remote command guard 和 OpenSSH argv manager |
+
+导出的 parity fixture 位于 `ts/parity/fixtures/`，TS parity CLI runner 位于
+`ts/parity/`，TS 红线检查位于 `scripts/check_ts_redlines.mjs`。
+
+## 运行时边界
+
+TS 线沿用 Python v4 的安全规则：
+
+- `@earendil-works/pi-agent-core` 可以驱动 ReAct/tool-calling loop，但
+  LinuxAgentToolGate 仍是敏感工具的第一道执行门禁。
+- `@earendil-works/pi-ai` 只作为 provider/model 抽象；密钥和 provider 配置仍以
+  LinuxAgent config 为准。
+- `@earendil-works/pi-tui` 可以渲染交互界面，但 audit JSONL 独立于 UI event。
+- `@earendil-works/pi-coding-agent` 仅作参考，禁止把它默认的 `bash`、`write` 或
+  `edit` 工具导入为 LinuxAgent 权限。
+- LLM 计划出的本地命令必须保持 argv 执行，禁止 shell 字符串执行。
+- 工具调用必须先经过 LinuxAgent tool gate，再进入执行。
+- pi-agent-core `afterToolCall` observation 返回模型前必须已经脱敏并限制长度。
+- 已批准的 command、file patch 或 SSH action 必须先追加 audit，再把 tool result
+  返回给模型。
+- 安全 sandbox profile 没有可执行 runner 时必须 fail closed。
+- noop runner 只能记录 `enforced: false`；普通 `spawn` 不能被当作 sandbox enforcement。
+- 命令输出进入模型分析前必须先脱敏并限制长度。
+- Prompt 模板继续放在 `prompts/`；TS 代码通过 prompt loader 加载，不把模板硬编码进代码。
+
+当前 TS 代码还没有对外支持的 CLI，也不会替代 `linuxagent`。未来的
+`linuxagent-ts` 入口必须保持显式实验状态，直到 policy、HITL、audit、sandbox、SSH、
+file patch、output redaction 和 harness parity 都满足对应 release scope。
+
+## Cutover staging
+
+`make cutover-check` 是未来默认运行时切换前的 opt-in readiness gate。它先运行
+Python release 门禁，再运行 TS ReAct 门禁（`make ts-check` 和 `make ts-parity`）。
+这个目标不会切换默认 `linuxagent` 入口。
+
+ReAct turn-level parity fixture 是 P0 cutover gate。`react-turn` suite 会通过
+pi-agent-core loop 和 LinuxAgent 自有工具覆盖 direct answer、首次审批、拒绝、
+同 thread `/resume` 权限、破坏性命令重新确认、非 TTY fail-closed、模型 observation
+脱敏、file patch rollback 和 SSH shell syntax blocking。
+
+CI 中的 `ts-experimental` job 继续和 Python release jobs 分离。它会上传 parity
+summary artifact；手动触发的 `cutover-readiness` job 可以运行完整
+`make cutover-check`，并上传单独的 summary artifact。
+
+默认运行时 promotion 前必须满足：
+
+- 所有 P0 ReAct fixtures 在 CI 中稳定通过
+- Python release gates 仍然通过
+- TS interactive HITL 和 `/resume` 通过 TTY smoke test
+- Python 和 TS security redlines 都通过
+- maintainer 明确批准默认运行时切换
+
+如果已经 promotion 的 TS 默认运行时出现 P0 安全回归，rollback 路径是恢复 Python
+`linuxagent` 入口，安全时只保留 `linuxagent-ts` 为实验入口，并在再次 promotion
+前添加 regression fixture。
+
+## 开发命令
+
+从仓库根目录安装依赖并运行 TS 门禁：
+
+```bash
+make ts-install
+make ts-check
+```
+
+可单独运行：
+
+```bash
+make ts-lint
+make ts-type
+make ts-test
+make ts-security
+make ts-parity
+```
+
+`make ts-parity` 运行当前 TS/Python parity runner；目前检查 policy fixture corpus、
+audit verifier 篡改检测、sandbox fail-closed 行为、output redaction 行为、file patch
+transaction rollback 和 runtime path-policy fail-closed 行为，以及 HITL
+same-thread/resume-scoped session permission；并为 SSH strict known-host、remote
+command guard 行为、ReAct turn-level parity fixtures 和必选 harness fixture index
+提供 parity 覆盖；同时覆盖初始 red-team policy slice，包括 protected tree delete、
+protected block-device mutation、network-to-shell、service mutation 和 mkfs 场景。
+生产运行时仍以 Python 门禁为准：`make test`、`make security`、`make red-team`、
+`make harness` 和 release 检查仍是权威门禁。
+
+实验 CLI 的 check 命令只校验显式传入的本地路径，不会调用模型 API：
+
+```bash
+node ts/apps/linuxagent-ts/dist/src/cli.js check \
+  --config ./config.yaml \
+  --policy ./configs/policy.default.yaml \
+  --audit ~/.linuxagent/audit.log
+```
+
+配置文件必须是私有权限（`chmod 600`）。检查通过返回 `0`，检查失败返回 `1`，
+CLI 用法错误返回 `2`。
+
+实验 audit verifier 会调用 TS hash-chain verifier：
+
+```bash
+node ts/apps/linuxagent-ts/dist/src/cli.js audit verify ~/.linuxagent/audit.log
+```
+
+有效日志返回 `0`，缺失或无效日志返回 `1`。
+
+`linuxagent-ts chat --input <text>` 用来验证实验 TUI 路由面，例如 `/new`、
+`/resume` 和 `/tools`。默认 runtime port 仍是安全占位实现，暂不调用 provider。
+以 `!` 开头的输入会被识别为 direct command mode；没有显式配置 direct command runner
+时默认 fail-closed。
+
+## 进度表
+
+| 范围 | 状态 |
+|---|---|
+| Workspace 和红线检查 | 已落地 |
+| 共享 contracts 和 Python fixture export | 已落地 |
+| policy parity engine | 已覆盖初始 fixture |
+| HITL 会话权限、审批默认值、audit hash chain | 已落地 |
+| local executor、sandbox contract、output redaction | 已落地 |
+| tool gate 连接 executor-backed command tool | 已落地 |
+| agent runtime prompt loader | 已落地 |
+| planner validation 和 fake model tests | 已落地 |
+| 带 sequential command tools 的最小 runtime wrapper | 已落地 |
+| tool result analysis/redaction hook | 已落地 |
+| 最小 runtime behavior tests | 已落地 |
+| 实验 TUI/CLI skeleton | 已落地 |
+| `linuxagent-ts check` implementation | 已落地 |
+| TUI approval selector 和 confirmation renderer | 已落地 |
+| slash router | 已落地 |
+| chat loop shell | 已落地 |
+| direct command mode | 已落地 |
+| SSH library decision | 已落地 |
+| remote profile validation | 已落地 |
+| remote command guard | 已落地 |
+| OpenSSH argv manager | 已落地 |
+| SSH approval/audit metadata integration | 已落地 |
+| FilePatchPlan contract | 已落地 |
+| file patch path policy | 已落地 |
+| file patch diff validator | 已落地 |
+| file patch transaction guard | 已落地 |
+| file patch runtime 集成 | 已落地 |
+| memory scope model | 已落地 |
+| memory read path | 已落地 |
+| memory write path pending candidates | 已落地 |
+| policy parity CLI runner | 已落地 |
+| harness fixture export 和必选场景索引 | 已落地 |
+| ReAct turn-level parity gate | 已落地 |
+| 实验 TS CI job | 已落地 |
+| cutover readiness staging | 已落地；默认运行时切换仍需单独 release change |
+
+后续修改 TS 行为时，同一个小交付里要同步更新本页以及相关 README/development 链接，
+确保公开文档和代码状态一致。

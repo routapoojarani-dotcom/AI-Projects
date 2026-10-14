@@ -1,0 +1,29 @@
+"""Terminal UI construction helpers."""
+
+from __future__ import annotations
+
+from ..config.models import UIConfig
+from ..i18n import Translator
+from ..interfaces import UserInterface
+from ..ui import ConsoleUI, WizardAwareUserInterface
+
+
+def build_ui(
+    config: UIConfig,
+    translator: Translator,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> UserInterface:
+    return WizardAwareUserInterface(
+        ConsoleUI(
+            theme=config.theme,
+            tui_layout=config.tui_layout,
+            prompt_symbol=config.prompt_symbol,
+            history_path=config.history_path.with_name("prompt_history"),
+            translator=translator,
+            provider=provider,
+            model=model,
+        ),
+        translator=translator,
+    )

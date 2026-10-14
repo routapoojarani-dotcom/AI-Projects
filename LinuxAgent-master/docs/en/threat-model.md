@@ -1,0 +1,80 @@
+# Threat Model
+
+LinuxAgent is a local CLI that can ask an LLM to propose Linux operations and
+then execute approved commands. The main design goal is not to sandbox Linux,
+but to make model-driven operations explicit, reviewable, and auditable.
+
+## Assets
+
+- Local and remote system integrity.
+- API keys and credentials in `config.yaml`.
+- Command output, logs, hostnames, usernames, IPs, paths, and production data.
+- SSH private keys and `known_hosts` trust decisions.
+- Audit log integrity at `~/.linuxagent/audit.log`.
+- Operator intent and approval decisions.
+
+## Trust Boundaries
+
+| Boundary | Trust assumption |
+|---|---|
+| User terminal | The local operator is trusted to approve or deny commands |
+| LLM provider | Not trusted with secrets or final authority |
+| Local subprocess | Executes with the invoking user's privileges; configured sandbox runners may add local process or OS boundaries |
+| SSH target | Must already be trusted through `known_hosts`; local OS sandboxing does not protect the remote host |
+| Config file | Trusted only if owned by the user and `chmod 600` |
+| Audit log | Local append-only best effort with hash-chain tamper detection; optional remote sink can anchor records outside the host |
+
+## Primary Threats and Mitigations
+
+| Threat | Mitigation |
+|---|---|
+| Prompt injection produces a dangerous command | Token-level policy engine, source-aware `LLM_FIRST_RUN`, destructive commands require confirmation |
+| User accidentally approves broad batch execution | Batch confirmation for host count greater than or equal to the configured threshold |
+| LLM output bypasses safety through quoting or shell syntax | `shlex` token facts plus raw embedded-danger checks |
+| Remote command expands unexpectedly through shell features | SSH cluster mode rejects shell chaining, redirects, command substitution, and variable expansion |
+| Remote SSH command runs with excessive privileges | Cluster remote profiles record cwd, environment policy, sudo policy, and audit metadata; recommended deployment uses low-privilege users |
+| Unknown SSH host enables MITM | `RejectPolicy` and `load_system_host_keys()` by default |
+| Secrets leak through logs or command output | `SecretStr`, config permission checks, output guard, redaction before LLM-facing analysis paths |
+| Audit log tampering hides an approval | Hash-chained JSONL records, `linuxagent audit verify`, and optional remote append-only sink forwarding |
+| Non-interactive automation silently approves work | No-TTY confirmation requests auto-deny |
+| Overly broad dependencies increase supply-chain risk | Major-version bounds plus release constraints file and build verification |
+| Operators assume sandbox isolation is active | Runtime records expose `runtime_label` (`no_isolation`, `process_limits_only`, `filesystem_isolation`, or `privileged_passthrough`) plus `enforced`; SSH protection is a least-privilege boundary, not local sandbox inheritance |
+
+## Out of Scope
+
+- Providing strong isolation for SSH targets. Remote execution relies on account
+  privileges, sudoers, known_hosts, confirmation, and audit rather than a remote
+  agent or container sandbox.
+- Preventing a malicious local root user from modifying files. A remote audit
+  sink can preserve already-forwarded records outside the host, but it cannot
+  prove events that were never written or forwarded before compromise.
+- Replacing host intrusion detection, EDR, SIEM, or privileged access
+  management.
+- Guaranteeing that LLM-generated analysis is correct.
+- Protecting data after the operator intentionally sends it to an external
+  provider.
+
+## Security Review Hotspots
+
+Changes in these areas require focused tests and careful review:
+
+- `src/linuxagent/policy/`
+- `src/linuxagent/executors/`
+- `src/linuxagent/cluster/`
+- `src/linuxagent/graph/`
+- `src/linuxagent/security/`
+- `src/linuxagent/audit.py`
+- `src/linuxagent/config/`
+
+## Operational Recommendations
+
+- Use a dedicated low-privilege OS account for routine operations.
+- Keep `config.yaml` local, owned by the operator, and `chmod 600`.
+- Register SSH host keys out of band before cluster use.
+- Configure `cluster.hosts[].remote_profile` with an expected cwd and keep sudo
+  disabled unless a minimal sudoers rule is reviewed.
+- Review audit logs after high-impact sessions.
+- For higher assurance, forward audit records to an append-only collector,
+  syslog pipeline, or object store controlled by a different trust domain.
+- Keep runtime policies environment-specific and test them with harness
+  scenarios before production use.

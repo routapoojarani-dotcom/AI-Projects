@@ -1,0 +1,234 @@
+"""Concurrent direct-answer subtasks."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+
+from langchain_core.messages import AIMessage, BaseMessage
+
+from ..interfaces import CommandSource
+from ..providers.errors import ProviderError
+from ..runtime_events import (
+    PlanItemStatus,
+    RuntimeEventPhase,
+    RuntimePlanItem,
+    RuntimeWorker,
+    WorkerStatus,
+    plan_legacy_event,
+    plan_work_item_event,
+    worker_group_event,
+)
+from ..turn_context import current_turn_context
+from .direct_answer import DirectAnswerContext, _complete_direct_answer
+from .events import RuntimeEventObserver, notify_event
+from .intent_router import ParallelDirectTask
+from .state import AgentState, reset_planning_for_response
+from .worker_events import notify_worker_lifecycle
+
+
+@dataclass(frozen=True)
+class ParallelDirectResult:
+    task: ParallelDirectTask
+    answer: str = ""
+    error: str = ""
+
+    @property
+    def succeeded(self) -> bool:
+        return bool(self.answer) and not self.error
+
+
+async def complete_parallel_direct_answer(
+    context: DirectAnswerContext,
+    *,
+    runtime_observer: RuntimeEventObserver | None,
+    messages: list[BaseMessage],
+    user_text: str,
+    current_trace_id: str,
+    tasks: tuple[ParallelDirectTask, ...],
+    router_answer: str,
+) -> AgentState:
+    await _notify_parallel_direct_plan(runtime_observer, current_trace_id, tasks, ())
+    await _notify_parallel_direct(runtime_observer, current_trace_id, WorkerStatus.RUNNING, tasks)
+    results = await asyncio.gather(
+        *(_complete_parallel_task(context, messages, current_trace_id, task) for task in tasks)
+    )
+    await _notify_parallel_direct_plan(runtime_observer, current_trace_id, tasks, tuple(results))
+    await _notify_parallel_direct_results(runtime_observer, current_trace_id, tuple(results))
+    return _parallel_direct_response_update(
+        current_trace_id,
+        _merge_parallel_answers(user_text, tuple(results), router_answer),
+    )
+
+
+async def _complete_parallel_task(
+    context: DirectAnswerContext,
+    messages: list[BaseMessage],
+    current_trace_id: str,
+    task: ParallelDirectTask,
+) -> ParallelDirectResult:
+    try:
+        answer = await _complete_direct_answer(
+            context,
+            messages,
+            task.prompt,
+            current_trace_id,
+            mode="parallel_direct_answer",
+        )
+    except ProviderError as exc:
+        return ParallelDirectResult(task, error=str(exc))
+    if not answer:
+        return ParallelDirectResult(task, error="empty answer")
+    return ParallelDirectResult(task, answer=answer)
+
+
+async def _notify_parallel_direct(
+    observer: RuntimeEventObserver | None,
+    trace_id: str,
+    phase: WorkerStatus,
+    tasks: tuple[ParallelDirectTask, ...],
+) -> None:
+    workers = _parallel_direct_workers(tasks, phase)
+    await notify_worker_lifecycle(
+        observer,
+        trace_id=trace_id,
+        workers=workers,
+        status=phase,
+    )
+    await notify_event(
+        observer,
+        worker_group_event(
+            trace_id=trace_id,
+            phase=phase,
+            label_key="runtime.group.direct_answer_tasks",
+            active=len(tasks) if phase is WorkerStatus.RUNNING else None,
+            workers=workers,
+        ),
+    )
+
+
+async def _notify_parallel_direct_results(
+    observer: RuntimeEventObserver | None,
+    trace_id: str,
+    results: tuple[ParallelDirectResult, ...],
+) -> None:
+    workers = _parallel_direct_result_workers(results)
+    await notify_worker_lifecycle(
+        observer,
+        trace_id=trace_id,
+        workers=workers,
+        status=WorkerStatus.FINISHED,
+    )
+    await notify_event(
+        observer,
+        worker_group_event(
+            trace_id=trace_id,
+            phase=WorkerStatus.FINISHED,
+            label_key="runtime.group.direct_answer_tasks",
+            active=0,
+            workers=workers,
+        ),
+    )
+
+
+async def _notify_parallel_direct_plan(
+    observer: RuntimeEventObserver | None,
+    trace_id: str,
+    tasks: tuple[ParallelDirectTask, ...],
+    results: tuple[ParallelDirectResult, ...],
+) -> None:
+    result_by_id = {result.task.id: result for result in results}
+    plan_items = tuple(
+        RuntimePlanItem(
+            step=task.goal,
+            status=_plan_status_for_task(task, result_by_id),
+        )
+        for task in tasks
+    )
+    turn = current_turn_context()
+    if turn is not None:
+        await notify_event(
+            observer,
+            plan_work_item_event(
+                thread_id=turn.thread_id,
+                turn_id=turn.turn_id,
+                trace_id=trace_id,
+                phase=RuntimeEventPhase.UPDATED,
+                items=plan_items,
+            ).to_event(),
+        )
+    await notify_event(
+        observer,
+        plan_legacy_event(trace_id=trace_id, phase=RuntimeEventPhase.UPDATED, items=plan_items),
+    )
+
+
+def _plan_status_for_task(
+    task: ParallelDirectTask,
+    result_by_id: dict[str, ParallelDirectResult],
+) -> PlanItemStatus:
+    result = result_by_id.get(task.id)
+    if result is None:
+        return PlanItemStatus.IN_PROGRESS
+    return PlanItemStatus.COMPLETED if result.succeeded else PlanItemStatus.FAILED
+
+
+def _parallel_direct_workers(
+    tasks: tuple[ParallelDirectTask, ...],
+    phase: WorkerStatus,
+) -> tuple[RuntimeWorker, ...]:
+    return tuple(
+        RuntimeWorker(
+            id=task.id,
+            name_key="runtime.agent.direct_answer_worker",
+            name_params={"index": index + 1},
+            status=phase,
+            goal=task.goal,
+            detail=task.goal,
+        )
+        for index, task in enumerate(tasks)
+    )
+
+
+def _parallel_direct_result_workers(
+    results: tuple[ParallelDirectResult, ...],
+) -> tuple[RuntimeWorker, ...]:
+    return tuple(
+        RuntimeWorker(
+            id=result.task.id,
+            name_key="runtime.agent.direct_answer_worker",
+            name_params={"index": index + 1},
+            status=WorkerStatus.FINISHED if result.succeeded else WorkerStatus.FAILED,
+            goal=result.task.goal,
+            summary=result.answer,
+            error=result.error,
+        )
+        for index, result in enumerate(results)
+    )
+
+
+def _merge_parallel_answers(
+    user_text: str,
+    results: tuple[ParallelDirectResult, ...],
+    router_answer: str,
+) -> str:
+    del user_text
+    successful = tuple(result for result in results if result.succeeded)
+    if not successful:
+        return router_answer
+    return "\n\n".join(_result_section(result) for result in successful)
+
+
+def _result_section(result: ParallelDirectResult) -> str:
+    return f"**{result.task.goal}**\n\n{result.answer}"
+
+
+def _parallel_direct_response_update(current_trace_id: str, response: str) -> AgentState:
+    return {
+        "trace_id": current_trace_id,
+        "messages": [AIMessage(content=response)],
+        **reset_planning_for_response(source=CommandSource.USER),
+        "wizard_result": None,
+        "wizard_failed_reason": None,
+        "wizard_attempted": False,
+    }

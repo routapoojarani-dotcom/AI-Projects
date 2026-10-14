@@ -1,0 +1,241 @@
+"""Build the LangGraph command-processing state machine."""
+
+from __future__ import annotations
+
+from typing import Any, TypeAlias
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from .command_verification import command_verification_update
+from .file_patch_nodes import (
+    file_patch_verification_update,
+    make_apply_file_patch_node,
+    make_file_patch_confirm_node,
+    make_repair_file_patch_node,
+)
+from .intent import make_parse_intent_node
+from .nodes import (
+    GraphDependencies,
+    make_advance_plan_node,
+    make_analyze_result_node,
+    make_confirm_node,
+    make_execute_node,
+    make_safety_check_node,
+)
+from .replanning import make_repair_plan_node
+from .routing import (
+    make_respond_block_node,
+    make_respond_node,
+    make_respond_refused_node,
+    make_response_builder_node,
+    make_response_guard_node,
+    make_route_after_execute,
+    route_after_file_patch_apply,
+    route_after_parse,
+    route_by_safety,
+)
+from .state import AgentState
+from .user_input_nodes import make_user_input_request_node
+from .wizard_nodes import make_wizard_node
+
+AgentGraph: TypeAlias = Any
+
+
+def build_agent_graph(deps: GraphDependencies) -> AgentGraph:
+    graph = StateGraph(AgentState)
+    _add_graph_nodes(graph, deps)
+    _add_graph_edges(graph, deps)
+    return graph.compile(checkpointer=deps.checkpointer or MemorySaver())
+
+
+def _add_graph_nodes(graph: Any, deps: GraphDependencies) -> None:
+    _add_planning_nodes(graph, deps)
+    _add_file_patch_nodes(graph, deps)
+    _add_execution_nodes(graph, deps)
+    _add_response_nodes(graph, deps)
+
+
+def _add_planning_nodes(graph: Any, deps: GraphDependencies) -> None:
+    graph.add_node(
+        "parse_intent",
+        _langgraph_node(
+            make_parse_intent_node(
+                deps.provider,
+                cluster_service=deps.cluster_service,
+                tools=deps.tools,
+                telemetry=deps.telemetry,
+                tool_observer=deps.tool_observer,
+                runtime_observer=deps.runtime_observer,
+                tool_runtime_limits=deps.tool_runtime_limits,
+                product_context=deps.product_context,
+                router_context=deps.router_context,
+                direct_context=deps.direct_context,
+                operating_manifest=deps.operating_manifest,
+                parallel_direct_answer_tasks=deps.parallel_direct_answer_tasks,
+                translator=deps.translator,
+            )
+        ),
+    )
+    graph.add_node(
+        "safety_check",
+        _langgraph_node(
+            make_safety_check_node(
+                deps.command_service,
+                deps.cluster_service,
+                deps.telemetry,
+                deps.runtime_observer,
+            )
+        ),
+    )
+    graph.add_node(
+        "wizard",
+        _langgraph_node(make_wizard_node(deps.provider, deps.audit, telemetry=deps.telemetry)),
+    )
+    graph.add_node("user_input", _langgraph_node(make_user_input_request_node()))
+    graph.add_node(
+        "confirm",
+        _langgraph_node(
+            make_confirm_node(
+                deps.audit,
+                deps.command_service,
+                deps.telemetry,
+                deps.runtime_observer,
+            )
+        ),
+    )
+
+
+def _add_file_patch_nodes(graph: Any, deps: GraphDependencies) -> None:
+    graph.add_node(
+        "file_patch_confirm",
+        _langgraph_node(make_file_patch_confirm_node(deps.audit, deps.file_patch_config)),
+    )
+    graph.add_node(
+        "apply_file_patch",
+        _langgraph_node(make_apply_file_patch_node(deps.audit, deps.file_patch_config)),
+    )
+    graph.add_node("file_patch_verification", _langgraph_node(file_patch_verification_update))
+    graph.add_node(
+        "repair_file_patch",
+        _langgraph_node(
+            make_repair_file_patch_node(
+                deps.provider,
+                deps.file_patch_config,
+                tools=deps.tools,
+                telemetry=deps.telemetry,
+                tool_observer=deps.tool_observer,
+                runtime_observer=deps.runtime_observer,
+                tool_runtime_limits=deps.tool_runtime_limits,
+            )
+        ),
+    )
+
+
+def _add_execution_nodes(graph: Any, deps: GraphDependencies) -> None:
+    graph.add_node(
+        "execute",
+        _langgraph_node(
+            make_execute_node(
+                deps.command_service,
+                deps.audit,
+                deps.cluster_service,
+                deps.background_jobs,
+                deps.telemetry,
+                deps.runtime_observer,
+            )
+        ),
+    )
+    graph.add_node("advance_plan", _langgraph_node(make_advance_plan_node(deps.runtime_observer)))
+    graph.add_node(
+        "repair_plan",
+        _langgraph_node(
+            make_repair_plan_node(
+                deps.provider,
+                max_repair_attempts=deps.command_plan_config.max_repair_attempts,
+                telemetry=deps.telemetry,
+                runtime_observer=deps.runtime_observer,
+            )
+        ),
+    )
+    graph.add_node(
+        "command_verification",
+        _langgraph_node(command_verification_update),
+    )
+    graph.add_node(
+        "analyze",
+        _langgraph_node(
+            make_analyze_result_node(
+                deps.provider,
+                deps.telemetry,
+                deps.runtime_observer,
+                translator=deps.translator,
+            )
+        ),
+    )
+
+
+def _add_response_nodes(graph: Any, deps: GraphDependencies) -> None:
+    graph.add_node("response_builder", _langgraph_node(make_response_builder_node(deps.translator)))
+    graph.add_node("response_guard", _langgraph_node(make_response_guard_node(deps.translator)))
+    graph.add_node("respond", _langgraph_node(make_respond_node()))
+    graph.add_node("respond_block", _langgraph_node(make_respond_block_node(deps.translator)))
+    graph.add_node("respond_refused", _langgraph_node(make_respond_refused_node(deps.translator)))
+
+
+def _add_graph_edges(graph: Any, deps: GraphDependencies) -> None:
+    graph.add_edge(START, "parse_intent")
+    _add_parse_edges(graph)
+    graph.add_conditional_edges(
+        "safety_check",
+        route_by_safety,
+        {"BLOCK": "respond_block", "CONFIRM": "confirm", "SAFE": "execute"},
+    )
+    graph.add_conditional_edges(
+        "execute",
+        make_route_after_execute(
+            deps.command_plan_config.max_repair_attempts,
+            stall_detection=deps.command_plan_config.stall_detection,
+            verify_before_complete=deps.command_plan_config.verify_before_complete,
+        ),
+        {
+            "CONTINUE_PLAN": "advance_plan",
+            "REPAIR_PLAN": "repair_plan",
+            "VERIFY": "command_verification",
+            "ANALYZE": "analyze",
+        },
+    )
+    graph.add_edge("advance_plan", "safety_check")
+    graph.add_edge("repair_plan", "safety_check")
+    graph.add_edge("command_verification", "safety_check")
+    graph.add_conditional_edges(
+        "apply_file_patch",
+        route_after_file_patch_apply,
+        {
+            "REPAIR_FILE_PATCH": "repair_file_patch",
+            "VERIFY_FILE_PATCH": "file_patch_verification",
+            "ANALYZE": "analyze",
+        },
+    )
+    graph.add_edge("file_patch_verification", "safety_check")
+    graph.add_edge("analyze", "response_builder")
+    graph.add_edge("response_builder", "response_guard")
+    graph.add_edge("response_guard", "respond")
+    graph.add_edge("respond", END)
+    graph.add_edge("respond_block", END)
+    graph.add_edge("respond_refused", END)
+
+
+def _add_parse_edges(graph: Any) -> None:
+    edges = {
+        "PATCH_CONFIRM": "file_patch_confirm",
+        "RESPOND": "response_builder",
+        "SAFETY": "safety_check",
+        "USER_INPUT_REQUEST": "user_input",
+        "WIZARD": "wizard",
+    }
+    graph.add_conditional_edges("parse_intent", route_after_parse, edges)
+
+
+def _langgraph_node(action: Any) -> Any:
+    return action

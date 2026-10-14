@@ -1,0 +1,185 @@
+"""Prompt-toolkit session management for the console UI."""
+
+from __future__ import annotations
+
+import os
+from asyncio import Event
+from collections.abc import AsyncGenerator, Callable, Iterable
+from pathlib import Path
+from typing import Any, cast
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from prompt_toolkit.validation import ValidationError, Validator
+
+from ..active_view import ActiveTokenUsageView
+from ..i18n import Translator, default_translator
+from ..product_context import slash_commands
+from .working_status import token_usage_text
+
+_DIRECT_COMMAND_PROMPT_STYLE = "ansibrightmagenta"
+
+
+class PromptSessionManager:
+    def __init__(
+        self,
+        *,
+        theme: str,
+        prompt_symbol: str,
+        history_path: Path,
+        session_factory: Any | None = None,
+        translator: Translator | None = None,
+    ) -> None:
+        self._theme = theme
+        self._prompt_symbol = prompt_symbol
+        self._history_path = history_path
+        self._translator = translator or default_translator()
+        self._session_factory = session_factory or self._default_session_factory
+        self._cancel_event: Event | None = None
+        self._cancel_reason_setter: Callable[[str], None] | None = None
+        self._activity_busy = False
+        self._token_usage: ActiveTokenUsageView | None = None
+        self._active_session: Any | None = None
+
+    def set_cancel_event(
+        self, cancel_event: Event, reason_setter: Callable[[str], None] | None = None
+    ) -> None:
+        self._cancel_event = cancel_event
+        self._cancel_reason_setter = reason_setter
+
+    def create_session(self) -> Any:
+        self._active_session = self._session_factory()
+        return self._active_session
+
+    def set_activity_busy(self, busy: bool) -> None:
+        if busy == self._activity_busy:
+            return
+        self._activity_busy = busy
+        self._invalidate_active_session()
+
+    def set_token_usage(self, usage: ActiveTokenUsageView | None) -> None:
+        if usage == self._token_usage:
+            return
+        self._token_usage = usage
+        self._invalidate_active_session()
+
+    def abort_active_prompt(self) -> bool:
+        app = getattr(self._active_session, "app", None)
+        exit_prompt = getattr(app, "exit", None)
+        if not callable(exit_prompt):
+            return False
+        try:
+            exit_prompt(result="")
+        except Exception:  # noqa: BLE001 - prompt-toolkit raises when no app is active
+            return False
+        return True
+
+    def dynamic_prompt(self, session: Any) -> Callable[[], list[tuple[str, str]]]:
+        def prompt() -> list[tuple[str, str]]:
+            return self.build_prompt(session.default_buffer.text)
+
+        return prompt
+
+    def build_prompt(self, current_text: str = "") -> list[tuple[str, str]]:
+        accent = "ansiblue" if self._theme == "light" else "ansibrightcyan"
+        symbol_style = "ansibrightblack"
+        if current_text.startswith("!"):
+            accent = _DIRECT_COMMAND_PROMPT_STYLE
+            symbol_style = _DIRECT_COMMAND_PROMPT_STYLE
+        return [
+            (f"bold {accent}", "linuxagent"),
+            ("", " "),
+            (symbol_style, self._prompt_symbol),
+            *_token_usage_prompt_fragments(self._token_usage, self._translator),
+            ("", " "),
+        ]
+
+    def _default_session_factory(self) -> PromptSession[str]:
+        self._history_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._history_path.exists():
+            fd = os.open(self._history_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+        os.chmod(self._history_path, 0o600)
+        os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+        return PromptSession(
+            history=FileHistory(str(self._history_path)),
+            completer=cast(Completer, SlashCommandCompleter(self._translator)),
+            validator=cast(Validator, _NonEmptyInputValidator()),
+            validate_while_typing=False,
+            complete_while_typing=True,
+            erase_when_done=True,
+            reserve_space_for_menu=8,
+            key_bindings=self._key_bindings(),
+        )
+
+    def _invalidate_active_session(self) -> None:
+        app = getattr(self._active_session, "app", None)
+        invalidate = getattr(app, "invalidate", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _key_bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        def _cancel_turn(_event: KeyPressEvent) -> None:
+            if self._cancel_event is not None:
+                if self._cancel_reason_setter is not None:
+                    self._cancel_reason_setter("escape")
+                self._cancel_event.set()
+
+        bindings.add("escape", eager=True)(_cancel_turn)
+        return bindings
+
+
+class SlashCommandCompleter:
+    """Prompt-toolkit completer for slash commands."""
+
+    def __init__(self, translator: Translator | None = None) -> None:
+        self._translator = translator or default_translator()
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
+        del complete_event
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for item in slash_commands(self._translator):
+            command = item.command
+            description = item.description
+            if command.startswith(text):
+                yield Completion(
+                    command,
+                    start_position=-len(text),
+                    display=command,
+                    display_meta=description,
+                )
+
+    async def get_completions_async(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> AsyncGenerator[Completion, None]:
+        for completion in self.get_completions(document, complete_event):
+            yield completion
+
+
+class _NonEmptyInputValidator:
+    def validate(self, document: Document) -> None:
+        if document.text.strip():
+            return
+        raise ValidationError(cursor_position=0)
+
+
+def _token_usage_prompt_fragments(
+    usage: ActiveTokenUsageView | None,
+    translator: Translator,
+) -> list[tuple[str, str]]:
+    if usage is None:
+        return []
+    return [
+        ("", " "),
+        ("ansibrightblack", token_usage_text(usage, translator)),
+    ]

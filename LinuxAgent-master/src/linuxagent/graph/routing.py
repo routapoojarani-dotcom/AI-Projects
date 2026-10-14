@@ -1,0 +1,168 @@
+"""Routing and terminal response nodes for the LinuxAgent graph."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+
+from langchain_core.messages import AIMessage
+
+from ..i18n import Translator, default_translator
+from ..interfaces import SafetyLevel
+from ..response_guard import guard_response_text
+from .file_patch_nodes import should_repair_file_patch
+from .plan_steps import has_next_plan_step
+from .replanning import should_repair_plan, should_verify_command_plan
+from .state import AgentState
+
+
+def make_respond_block_node(
+    translator: Translator | None = None,
+) -> Callable[[AgentState], Awaitable[AgentState]]:
+    tr = translator or default_translator()
+
+    async def respond_block(state: AgentState) -> AgentState:
+        reason = state.get("safety_reason") or "command blocked by safety policy"
+        if reason == default_translator().t("graph.argv_retry_exhausted"):
+            reason = tr.t("graph.argv_retry_exhausted")
+        return {"messages": [AIMessage(content=tr.t("graph.blocked", reason=reason))]}
+
+    return respond_block
+
+
+def make_respond_refused_node(
+    translator: Translator | None = None,
+) -> Callable[[AgentState], Awaitable[AgentState]]:
+    tr = translator or default_translator()
+
+    async def respond_refused(state: AgentState) -> AgentState:
+        command = state.get("pending_command") or ""
+        return {"messages": [AIMessage(content=tr.t("graph.refused", command=command))]}
+
+    return respond_refused
+
+
+def make_response_builder_node(
+    translator: Translator | None = None,
+) -> Callable[[AgentState], Awaitable[AgentState]]:
+    tr = translator or default_translator()
+
+    async def response_builder(state: AgentState) -> AgentState:
+        if state.get("messages"):
+            return {}
+        return {"messages": [AIMessage(content=tr.t("graph.done"))]}
+
+    return response_builder
+
+
+def make_response_guard_node(
+    translator: Translator | None = None,
+) -> Callable[[AgentState], Awaitable[AgentState]]:
+    tr = translator or default_translator()
+
+    async def response_guard(state: AgentState) -> AgentState:
+        messages = state.get("messages") or []
+        last = messages[-1] if messages else None
+        if not isinstance(last, AIMessage) or not isinstance(last.content, str):
+            return {}
+        result = guard_response_text(
+            last.content,
+            injection_replacement=tr.t("graph.response_guard_injection_removed"),
+            blocked_response=lambda reason: tr.t(
+                "graph.response_guard_blocked",
+                reason=reason,
+            ),
+            translator=tr,
+        )
+        if not result.changed:
+            return {}
+        return {"messages": [AIMessage(content=result.text, id=last.id)]}
+
+    return response_guard
+
+
+def make_respond_node() -> Callable[[AgentState], Awaitable[AgentState]]:
+    async def respond(_state: AgentState) -> AgentState:
+        return {}
+
+    return respond
+
+
+async def respond_block_node(state: AgentState) -> AgentState:
+    return await make_respond_block_node()(state)
+
+
+async def respond_refused_node(state: AgentState) -> AgentState:
+    return await make_respond_refused_node()(state)
+
+
+async def response_builder_node(state: AgentState) -> AgentState:
+    return await make_response_builder_node()(state)
+
+
+async def response_guard_node(state: AgentState) -> AgentState:
+    return await make_response_guard_node()(state)
+
+
+async def respond_node(state: AgentState) -> AgentState:
+    return await make_respond_node()(state)
+
+
+async def route_by_safety(state: AgentState) -> str:
+    level = state.get("safety_level")
+    if level is SafetyLevel.BLOCK:
+        return "BLOCK"
+    if level is SafetyLevel.CONFIRM:
+        return "CONFIRM"
+    return "SAFE"
+
+
+async def route_after_parse(state: AgentState) -> str:
+    if state.get("direct_response"):
+        return "RESPOND"
+    if state.get("file_patch_plan") is not None:
+        return "PATCH_CONFIRM"
+    if state.get("wizard_completed"):
+        return "SAFETY"
+    if state.get("user_input_completed"):
+        return "SAFETY"
+    if state.get("wizard_context") and state.get("wizard_result") is None:
+        return "WIZARD"
+    if state.get("user_input_request") and state.get("user_input_result") is None:
+        return "USER_INPUT_REQUEST"
+    return "SAFETY"
+
+
+async def route_after_execute(state: AgentState) -> str:
+    if has_next_plan_step(state):
+        return "CONTINUE_PLAN"
+    if should_repair_plan(state):
+        return "REPAIR_PLAN"
+    return "ANALYZE"
+
+
+def make_route_after_execute(
+    max_repair_attempts: int,
+    *,
+    stall_detection: bool = True,
+    verify_before_complete: bool = False,
+) -> Callable[[AgentState], Awaitable[str]]:
+    async def route_after_execute_node(state: AgentState) -> str:
+        if has_next_plan_step(state):
+            return "CONTINUE_PLAN"
+        if should_repair_plan(
+            state, max_repair_attempts=max_repair_attempts, stall_detection=stall_detection
+        ):
+            return "REPAIR_PLAN"
+        if should_verify_command_plan(state, verify_before_complete=verify_before_complete):
+            return "VERIFY"
+        return "ANALYZE"
+
+    return route_after_execute_node
+
+
+async def route_after_file_patch_apply(state: AgentState) -> str:
+    if should_repair_file_patch(state):
+        return "REPAIR_FILE_PATCH"
+    if state.get("file_patch_verification_pending"):
+        return "VERIFY_FILE_PATCH"
+    return "ANALYZE"

@@ -1,0 +1,67 @@
+"""Conversation-scoped command permission helpers."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..interfaces import CommandSource, SafetyLevel
+from ..policy.argv import command_permission_key, command_permission_matches
+from ..policy.capabilities import DESTRUCTIVE_CAPABILITY_PREFIXES
+from ..services import CommandService
+from .payloads import may_whitelist
+from .state import AgentState
+
+
+def updated_command_permissions(
+    state: AgentState,
+    payload: dict[str, Any],
+    command_service: CommandService,
+    *,
+    allow_all: bool,
+) -> tuple[str, ...]:
+    existing = tuple(state.get("command_permissions", ()))
+    if not may_whitelist(state, payload) or not conversation_permissions_enabled(command_service):
+        return existing
+    candidates = _plan_commands(state) if allow_all else _current_command(state)
+    allowed = list(existing)
+    for command in candidates:
+        verdict = command_service.classify(command, source=CommandSource.LLM)
+        if verdict.level is SafetyLevel.BLOCK or not verdict.can_whitelist:
+            continue
+        if has_destructive_capability(verdict.capabilities):
+            continue
+        key = normalize_command(command)
+        if key is not None and key not in allowed and not _permission_exists(allowed, command):
+            allowed.append(key)
+    return tuple(allowed)
+
+
+def normalize_command(command: str) -> str | None:
+    return command_permission_key(command)
+
+
+def conversation_permissions_enabled(command_service: CommandService) -> bool:
+    executor = getattr(command_service, "executor", None)
+    return bool(getattr(executor, "session_whitelist_enabled", True))
+
+
+def has_destructive_capability(capabilities: tuple[str, ...]) -> bool:
+    return any(
+        capability.startswith(DESTRUCTIVE_CAPABILITY_PREFIXES) for capability in capabilities
+    )
+
+
+def _current_command(state: AgentState) -> tuple[str, ...]:
+    command = state.get("pending_command")
+    return (command,) if command else ()
+
+
+def _plan_commands(state: AgentState) -> tuple[str, ...]:
+    plan = state.get("command_plan")
+    if plan is None:
+        return _current_command(state)
+    return tuple(item.command for item in plan.commands)
+
+
+def _permission_exists(permissions: list[str], command: str) -> bool:
+    return any(command_permission_matches(permission, command) for permission in permissions)

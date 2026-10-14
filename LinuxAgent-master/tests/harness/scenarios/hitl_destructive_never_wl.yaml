@@ -1,0 +1,18 @@
+scenario: "destructive command still confirms even if preloaded"
+provider_responses:
+  - '{"goal":"delete temp path","commands":[{"command":"rm -rf /tmp/foo","purpose":"remove temp path","read_only":false,"target_hosts":[]}],"risk_summary":"destructive","preflight_checks":[],"verification_commands":[],"rollback_commands":[],"requires_root":false,"expected_side_effects":["delete files"]}'
+  - "执行完成"
+setup:
+  session_whitelist:
+    - "rm -rf /tmp/foo"
+inputs:
+  - role: human
+    content: "删除 /tmp/foo"
+expected_interrupts:
+  - type: confirm_command
+    is_destructive: true
+resume:
+  decision: "yes"
+  latency_ms: 200
+expected:
+  command_executed: true

@@ -1,0 +1,16 @@
+scenario: "non tty decision denied"
+provider_responses:
+  - '{"goal":"say hello","commands":[{"command":"/bin/echo hello","purpose":"emit hello","read_only":true,"target_hosts":[]}],"risk_summary":"read-only","preflight_checks":[],"verification_commands":[],"rollback_commands":[],"requires_root":false,"expected_side_effects":[]}'
+inputs:
+  - role: human
+    content: "ls /"
+expected_interrupts:
+  - type: confirm_command
+resume:
+  decision: "non_tty_auto_deny"
+  latency_ms: 0
+expected:
+  command_executed: false
+  audit_log_contains:
+    - event: confirm_decision
+      decision: "non_tty_auto_deny"

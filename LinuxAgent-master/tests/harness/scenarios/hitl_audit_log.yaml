@@ -1,0 +1,21 @@
+scenario: "audit log written for hitl flow"
+provider_responses:
+  - '{"goal":"audited echo","commands":[{"command":"/bin/echo audited","purpose":"emit audited text","read_only":true,"target_hosts":[]}],"risk_summary":"read-only","preflight_checks":[],"verification_commands":[],"rollback_commands":[],"requires_root":false,"expected_side_effects":[]}'
+  - "审计完成"
+inputs:
+  - role: human
+    content: "run audited command"
+expected_interrupts:
+  - type: confirm_command
+resume:
+  decision: "yes"
+  latency_ms: 25
+expected:
+  command_executed: true
+  exit_code: 0
+  audit_log_contains:
+    - event: confirm_begin
+    - event: confirm_decision
+      decision: "yes"
+    - event: command_executed
+      command: /bin/echo audited

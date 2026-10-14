@@ -1,0 +1,480 @@
+"""Tool sandbox metadata and runtime limits."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from langchain_core.tools import BaseTool
+
+from ..runtime_control import CancellationToken, cancellation_scope, current_cancellation_token
+from ..sandbox import SandboxProfile
+from ..security import redact_record, redact_text
+from .runtime_context import tool_trace_context
+
+SANDBOX_METADATA_KEY = "linuxagent_sandbox"
+SYNC_TOOL_POLL_SECONDS = 0.01
+_CURRENT_TOOL_DEADLINE: ContextVar[float | None] = ContextVar(
+    "linuxagent_tool_deadline",
+    default=None,
+)
+
+
+class ToolHITLMode(StrEnum):
+    NONE = "none"
+    POLICY_GATED = "policy_gated"
+    REQUIRED = "required"
+
+
+class ToolExecutionCancelledError(RuntimeError):
+    """Raised by cooperative tools when the active turn is cancelled."""
+
+
+class ToolDeadlineExceededError(TimeoutError):
+    """Raised by cooperative tools when their configured runtime deadline expires."""
+
+
+@dataclass(frozen=True)
+class ToolSandboxSpec:
+    profile: SandboxProfile
+    allowed_roots: tuple[Path, ...] = ()
+    max_file_bytes: int | None = None
+    max_output_chars: int | None = None
+    max_matches: int | None = None
+    timeout_seconds: float | None = None
+    read_files: bool = False
+    write_files: bool = False
+    execute_commands: bool = False
+    system_inspect: bool = False
+    network_access: bool = False
+    parallel_safe: bool = False
+    resource_keys: tuple[str, ...] = ()
+    hitl: ToolHITLMode = ToolHITLMode.NONE
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "profile": self.profile.value,
+            "parallel_safe": self.parallel_safe,
+            "resource_keys": list(self.resource_keys),
+            "permissions": {
+                "read_files": self.read_files,
+                "write_files": self.write_files,
+                "execute_commands": self.execute_commands,
+                "system_inspect": self.system_inspect,
+                "network_access": self.network_access,
+                "hitl": self.hitl.value,
+            },
+            "allowed_roots": [str(root) for root in self.allowed_roots],
+            "max_file_bytes": self.max_file_bytes,
+            "max_output_chars": self.max_output_chars,
+            "max_matches": self.max_matches,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class ToolRuntimeLimits:
+    max_rounds: int = 3
+    timeout_seconds: float = 5.0
+    max_output_chars: int = 20000
+    max_total_output_chars: int = 60000
+
+
+@dataclass(frozen=True)
+class ToolRunResult:
+    content: str
+    event: dict[str, Any]
+    output_chars: int
+
+
+def attach_tool_sandbox(tool: BaseTool, spec: ToolSandboxSpec) -> BaseTool:
+    metadata = dict(tool.metadata or {})
+    metadata[SANDBOX_METADATA_KEY] = spec.to_record()
+    tool.metadata = metadata
+    return tool
+
+
+def current_tool_deadline() -> float | None:
+    """Return the active tool deadline as ``time.monotonic()`` seconds."""
+
+    return _CURRENT_TOOL_DEADLINE.get()
+
+
+def raise_if_tool_runtime_cancelled(*, deadline: float | None = None) -> None:
+    token = current_cancellation_token()
+    if token is not None and token.is_cancelled():
+        raise ToolExecutionCancelledError(token.reason or "tool call cancelled")
+    active_deadline = current_tool_deadline() if deadline is None else deadline
+    if active_deadline is not None and time.monotonic() >= active_deadline:
+        raise ToolDeadlineExceededError("tool exceeded configured timeout")
+
+
+async def invoke_tool_with_sandbox(
+    tool: BaseTool,
+    args: dict[str, Any],
+    *,
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None = None,
+    cancellation_token: CancellationToken | None = None,
+) -> ToolRunResult:
+    with cancellation_scope(cancellation_token):
+        preflight = _tool_preflight_result(
+            tool, args, limits, remaining_total_chars, trace_id, cancellation_token
+        )
+        if preflight is not None:
+            return preflight
+        result = await _invoke_tool_result(tool, args, limits, remaining_total_chars, trace_id)
+    if isinstance(result, ToolRunResult):
+        return result
+    return _finish_tool_result(tool, args, result, limits, remaining_total_chars, trace_id)
+
+
+def _tool_exception_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None,
+    exc: Exception,
+) -> ToolRunResult:
+    return _tool_error_result(
+        tool,
+        args,
+        _error_status(exc),
+        _redacted_output(str(exc)),
+        limits,
+        remaining_total_chars,
+        trace_id,
+    )
+
+
+async def _invoke_tool_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None,
+) -> ToolRunResult | Any:
+    timeout = _tool_timeout(tool, limits)
+    try:
+        with _tool_deadline_scope(time.monotonic() + timeout):
+            return await asyncio.wait_for(_invoke_tool(tool, args, trace_id), timeout=timeout)
+    except TimeoutError:
+        return _tool_timeout_result(tool, args, limits, remaining_total_chars, timeout, trace_id)
+    except Exception as exc:  # noqa: BLE001 - tool failures are returned to the model
+        return _tool_exception_result(tool, args, limits, remaining_total_chars, trace_id, exc)
+
+
+def _finish_tool_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    raw_result: Any,
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None,
+) -> ToolRunResult:
+    content, truncated = _finalize_tool_content(raw_result, limits, remaining_total_chars)
+    status = "truncated" if truncated else "allowed"
+    return ToolRunResult(
+        content=content,
+        event=_tool_event(
+            tool,
+            args,
+            "end",
+            status,
+            content,
+            truncated=truncated,
+            trace_id=trace_id,
+        ),
+        output_chars=len(content),
+    )
+
+
+def _tool_preflight_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None,
+    cancellation_token: CancellationToken | None,
+) -> ToolRunResult | None:
+    if tool_sandbox_record(tool) is None:
+        return _tool_denied_missing_metadata(
+            tool,
+            args,
+            limits,
+            remaining_total_chars,
+            trace_id,
+        )
+    if not _tool_cancelled(cancellation_token):
+        return None
+    return _tool_cancelled_result(
+        tool,
+        args,
+        limits,
+        remaining_total_chars,
+        cancellation_token,
+        trace_id,
+    )
+
+
+def _tool_denied_missing_metadata(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None,
+) -> ToolRunResult:
+    return _tool_error_result(
+        tool,
+        args,
+        "denied",
+        "tool is missing ToolSandboxSpec metadata",
+        limits,
+        remaining_total_chars,
+        trace_id,
+    )
+
+
+def _tool_timeout_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    timeout: float,
+    trace_id: str | None,
+) -> ToolRunResult:
+    return _tool_error_result(
+        tool,
+        args,
+        "timeout",
+        f"tool exceeded {timeout}s",
+        limits,
+        remaining_total_chars,
+        trace_id,
+    )
+
+
+def _tool_cancelled_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    cancellation_token: CancellationToken | None,
+    trace_id: str | None,
+) -> ToolRunResult:
+    reason = cancellation_token.reason if cancellation_token is not None else None
+    return _tool_error_result(
+        tool,
+        args,
+        "cancelled",
+        reason or "tool call cancelled",
+        limits,
+        remaining_total_chars,
+        trace_id,
+    )
+
+
+async def _invoke_tool(tool: BaseTool, args: dict[str, Any], trace_id: str | None) -> Any:
+    if _has_async_tool_callable(tool):
+        with tool_trace_context(trace_id):
+            return await tool.ainvoke(args)
+    return await _invoke_sync_tool_off_loop(tool, args, trace_id)
+
+
+async def _invoke_sync_tool_off_loop(
+    tool: BaseTool, args: dict[str, Any], trace_id: str | None
+) -> Any:
+    finished = threading.Event()
+    result: dict[str, Any] = {}
+    context = copy_context()
+
+    def run() -> None:
+        try:
+            result["value"] = _invoke_sync_tool(tool, args, trace_id)
+        except BaseException as exc:  # noqa: BLE001 - propagated to tool error handling
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(
+        target=lambda: context.run(run),
+        name="linuxagent-tool-call",
+        daemon=True,
+    )
+    thread.start()
+    while not finished.is_set():  # noqa: ASYNC110 - completion comes from a worker thread.
+        await asyncio.sleep(SYNC_TOOL_POLL_SECONDS)
+    error = result.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return result.get("value")
+
+
+@contextmanager
+def _tool_deadline_scope(deadline: float | None) -> Iterator[None]:
+    token = _CURRENT_TOOL_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _CURRENT_TOOL_DEADLINE.reset(token)
+
+
+def _invoke_sync_tool(tool: BaseTool, args: dict[str, Any], trace_id: str | None) -> Any:
+    with tool_trace_context(trace_id):
+        return tool.invoke(args)
+
+
+def _has_async_tool_callable(tool: BaseTool) -> bool:
+    return callable(getattr(tool, "coroutine", None)) or callable(getattr(tool, "afunc", None))
+
+
+def _tool_error_result(
+    tool: BaseTool,
+    args: dict[str, Any],
+    status: str,
+    message: str,
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+    trace_id: str | None = None,
+) -> ToolRunResult:
+    content, truncated = _finalize_tool_content(
+        _structured_error(tool.name, status, message),
+        limits,
+        remaining_total_chars,
+    )
+    return ToolRunResult(
+        content=content,
+        event=_tool_event(
+            tool,
+            args,
+            "error",
+            status,
+            content,
+            truncated=truncated,
+            trace_id=trace_id,
+        ),
+        output_chars=len(content),
+    )
+
+
+def tool_sandbox_record(tool: BaseTool) -> dict[str, object] | None:
+    metadata = tool.metadata or {}
+    record = metadata.get(SANDBOX_METADATA_KEY)
+    return record if isinstance(record, dict) else None
+
+
+def _tool_timeout(tool: BaseTool, limits: ToolRuntimeLimits) -> float:
+    record = tool_sandbox_record(tool) or {}
+    raw = record.get("timeout_seconds")
+    if isinstance(raw, int | float) and raw > 0:
+        return min(float(raw), limits.timeout_seconds)
+    return limits.timeout_seconds
+
+
+def _tool_cancelled(cancellation_token: CancellationToken | None) -> bool:
+    return bool(cancellation_token and cancellation_token.is_cancelled())
+
+
+def _tool_output_to_str(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _redacted_output(result: Any) -> str:
+    if isinstance(result, str):
+        return redact_text(result).text
+    if isinstance(result, dict):
+        return json.dumps(redact_record(result), ensure_ascii=False, default=str)
+    if isinstance(result, list):
+        return json.dumps(
+            [redact_record({"value": item})["value"] for item in result],
+            ensure_ascii=False,
+            default=str,
+        )
+    return redact_text(_tool_output_to_str(result)).text
+
+
+def _finalize_tool_content(
+    result: Any,
+    limits: ToolRuntimeLimits,
+    remaining_total_chars: int,
+) -> tuple[str, bool]:
+    content = _redacted_output(result)
+    limit = min(limits.max_output_chars, max(remaining_total_chars, 0))
+    return _truncate(content, limit)
+
+
+def _truncate(content: str, limit: int) -> tuple[str, bool]:
+    if limit < 1:
+        return "[truncated: tool output limit exhausted]", True
+    if len(content) <= limit:
+        return content, False
+    marker = "[truncated]"
+    if limit <= len(marker):
+        return marker[:limit], True
+    keep = limit - len(marker)
+    return f"{content[:keep]}{marker}", True
+
+
+def _tool_event(
+    tool: BaseTool,
+    args: dict[str, Any],
+    phase: str,
+    status: str,
+    output: str,
+    *,
+    truncated: bool = False,
+    trace_id: str | None = None,
+) -> dict[str, Any]:
+    redacted_args = redact_record({"args": args}).get("args", {})
+    return {
+        "type": "tool",
+        "phase": phase,
+        "status": status,
+        "tool_name": tool.name,
+        "args": redacted_args if isinstance(redacted_args, dict) else {},
+        "sandbox": tool_sandbox_record(tool),
+        "output_preview": output[:500],
+        "output_text": output,
+        "output_chars": len(output),
+        "truncated": truncated,
+        "trace_id": trace_id,
+    }
+
+
+def _structured_error(tool_name: str, status: str, message: str) -> str:
+    return json.dumps(
+        {
+            "status": "error",
+            "tool": tool_name,
+            "error_type": status,
+            "message": message,
+            "constraint": (
+                "Do not infer facts from unread content. "
+                "Ask for an allowed path, config update, or approved command."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _error_status(exc: Exception) -> str:
+    if isinstance(exc, ToolExecutionCancelledError):
+        return "cancelled"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if exc.__class__.__name__ in {"WorkspaceAccessError", "LogFileAccessError"}:
+        return "denied"
+    return "error"

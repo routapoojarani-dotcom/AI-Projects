@@ -1,0 +1,372 @@
+"""Runtime integration coverage for LinuxAgent over a real LangGraph graph."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from langchain_core.messages import BaseMessage
+
+from linuxagent.app import LinuxAgent
+from linuxagent.audit import AuditLog
+from linuxagent.cluster.remote_command import RemoteCommandError, validate_remote_command
+from linuxagent.config.models import (
+    ClusterConfig,
+    ClusterHost,
+    ClusterRemoteProfile,
+    CommandPlanConfig,
+    SecurityConfig,
+)
+from linuxagent.executors import LinuxCommandExecutor, SessionWhitelist
+from linuxagent.graph import GraphDependencies, build_agent_graph
+from linuxagent.graph.runtime import GraphRuntime
+from linuxagent.interfaces import LLM_CALL_METADATA_KEY, ExecutionResult
+from linuxagent.plans import command_plan_json
+from linuxagent.services import ChatService, ClusterService, CommandService
+from linuxagent.usage_insights import ContextManager
+
+
+class _Provider:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = list(responses)
+        self.complete_messages: list[list[BaseMessage]] = []
+
+    async def complete(self, messages: list[BaseMessage], **kwargs: Any) -> str:
+        self.complete_messages.append(messages)
+        if _is_llm_call(kwargs, node="parse_intent", mode="intent_router"):
+            if self._responses and _is_intent_router_response(self._responses[0]):
+                return self._responses.pop(0)
+            return _router_response("COMMAND_PLAN")
+        if _is_llm_call(kwargs, node="parse_intent", mode="planner_gate"):
+            return _continue_planning_plan_json()
+        return self._responses.pop(0)
+
+    async def complete_with_tools(
+        self, messages: list[BaseMessage], tools: list[Any], **kwargs: Any
+    ) -> str:
+        del tools
+        return await self.complete(messages, **kwargs)
+
+    def stream(self, messages: list[BaseMessage], **kwargs: Any) -> None:
+        del messages, kwargs
+        raise NotImplementedError
+
+
+class _UI:
+    def __init__(self, response: dict[str, Any] | None = None) -> None:
+        self.response = {"decision": "yes", "latency_ms": 1} if response is None else response
+        self.interrupts: list[dict[str, Any]] = []
+        self.printed: list[str] = []
+        self.user_inputs: list[str] = []
+        self.execution_results: list[ExecutionResult] = []
+
+    async def input_stream(self) -> AsyncIterator[str]:
+        if False:
+            yield ""
+
+    async def handle_interrupt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.interrupts.append(payload)
+        return self.response
+
+    def is_interactive(self) -> bool:
+        return False
+
+    async def print(self, text: str) -> None:
+        self.printed.append(text)
+
+    async def print_user_input(self, text: str) -> None:
+        self.user_inputs.append(text)
+
+    async def print_execution_result(self, result: ExecutionResult) -> None:
+        self.execution_results.append(result)
+
+    def clear_activity(self) -> None:
+        return None
+
+
+def _router_response(mode: str, answer: str = "", reason: str = "test route") -> str:
+    return json.dumps({"mode": mode, "answer": answer, "reason": reason}, ensure_ascii=False)
+
+
+def _continue_planning_plan_json() -> str:
+    return json.dumps(
+        {"plan_type": "continue_planning", "reason": "integration planning needed"},
+        ensure_ascii=False,
+    )
+
+
+def _is_intent_router_response(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("mode") in {
+        "DIRECT_ANSWER",
+        "COMMAND_PLAN",
+        "CLARIFY",
+    }
+
+
+def _is_llm_call(kwargs: dict[str, Any], *, node: str, mode: str) -> bool:
+    metadata = kwargs.get(LLM_CALL_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        return False
+    attributes = metadata.get("attributes")
+    return (
+        isinstance(attributes, dict)
+        and attributes.get("node") == node
+        and attributes.get("mode") == mode
+    )
+
+
+def _multi_command_plan_json(commands: list[str]) -> str:
+    payload = json.loads(command_plan_json(commands[0]))
+    payload["commands"] = [
+        {
+            "command": command,
+            "purpose": f"Run {command}",
+            "read_only": True,
+            "target_hosts": [],
+        }
+        for command in commands
+    ]
+    return json.dumps(payload)
+
+
+async def _print_result_events(ui: _UI, event: dict[str, Any]) -> None:
+    if event.get("type") != "command" or event.get("phase") != "result":
+        return
+    result = event.get("result")
+    if isinstance(result, ExecutionResult):
+        await ui.print_execution_result(result)
+
+
+class _Monitoring:
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+class _FakeSSH:
+    async def execute_many(
+        self, hosts: list[ClusterHost], command: str, **kwargs: Any
+    ) -> dict[str, ExecutionResult | RemoteCommandError]:
+        del kwargs
+        try:
+            validate_remote_command(command)
+        except RemoteCommandError as exc:
+            return {host.name: exc for host in hosts}
+        return {
+            host.name: ExecutionResult(
+                command=command,
+                exit_code=0,
+                stdout=f"{host.name}:{command}",
+                stderr="",
+                duration=0.01,
+            )
+            for host in hosts
+        }
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.integration
+async def test_agent_runtime_confirms_and_resumes_llm_command(tmp_path: Path) -> None:
+    provider = _Provider([command_plan_json("/bin/echo runtime"), "runtime analysis"])
+    ui = _UI()
+    agent = _agent(tmp_path, provider=provider, ui=ui)
+
+    await agent.run_turn("say runtime", thread_id="runtime-confirm")
+
+    assert ui.interrupts[0]["type"] == "confirm_command"
+    assert ui.interrupts[0]["command"] == "/bin/echo runtime"
+    assert [result.command for result in ui.execution_results] == ["/bin/echo runtime"]
+    assert ui.printed == ["runtime analysis"]
+    assert "runtime" in str(provider.complete_messages[-1][-1].content)
+    history_text = "\n".join(str(message.content) for message in agent.chat_service.snapshot())
+    assert "LinuxAgent execution result" in history_text
+    assert "/bin/echo runtime" in history_text
+
+
+@pytest.mark.integration
+async def test_agent_runtime_continues_multi_step_plan_after_first_confirm(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        [
+            _multi_command_plan_json(["/bin/echo first", "/bin/echo second"]),
+            "multi-step analysis",
+        ]
+    )
+    ui = _UI()
+    agent = _agent(tmp_path, provider=provider, ui=ui)
+
+    await agent.run_turn("runtime multi-step", thread_id="runtime-multi-step")
+
+    assert [payload["command"] for payload in ui.interrupts] == [
+        "/bin/echo first",
+        "/bin/echo second",
+    ]
+    assert ui.printed == ["multi-step analysis"]
+    analysis_prompt = str(provider.complete_messages[-1][-1].content)
+    assert "/bin/echo first" in analysis_prompt
+    assert "/bin/echo second" in analysis_prompt
+
+
+@pytest.mark.integration
+async def test_agent_runtime_prints_command_results_from_runtime_events(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        [
+            _multi_command_plan_json(["/bin/echo first", "/bin/echo second"]),
+            "visible analysis",
+        ]
+    )
+    ui = _UI({"decision": "yes_all", "latency_ms": 1})
+    agent = _agent(
+        tmp_path,
+        provider=provider,
+        ui=ui,
+        runtime_observer=lambda event: _print_result_events(ui, event),
+    )
+
+    result = await agent.run_turn("visible execution", thread_id="visible-execution")
+
+    assert result["execution_results_visible"] is True
+    assert [item.command for item in ui.execution_results] == [
+        "/bin/echo first",
+        "/bin/echo second",
+    ]
+    assert ui.printed == ["visible analysis"]
+
+
+@pytest.mark.integration
+async def test_agent_runtime_stops_repairing_failed_command_plan_at_limit(
+    tmp_path: Path,
+) -> None:
+    provider = _Provider(
+        [
+            command_plan_json("/bin/false"),
+            command_plan_json("/bin/false"),
+            command_plan_json("/bin/false"),
+            "failed command analysis",
+        ]
+    )
+    ui = _UI()
+    agent = _agent(
+        tmp_path,
+        provider=provider,
+        ui=ui,
+        # This case isolates the max_repair_attempts limit: every repair proposes
+        # the same failing command, so stall detection (on by default) would stop
+        # after the first repair. Disable it here so the limit itself terminates
+        # the loop; stall detection has its own dedicated unit coverage.
+        command_plan_config=CommandPlanConfig(max_repair_attempts=2, stall_detection=False),
+    )
+
+    await agent.run_turn("repair loop", thread_id="runtime-repair-limit")
+
+    assert ui.printed == ["failed command analysis"]
+    assert [payload["command"] for payload in ui.interrupts] == ["/bin/false"]
+    repair_prompt = next(
+        str(messages[-1].content)
+        for messages in provider.complete_messages
+        if "Failed command results" in str(messages[-1].content)
+    )
+    assert "duration_seconds" in repair_prompt
+    assert "sandbox:" in repair_prompt
+    analysis_prompt = str(provider.complete_messages[-1][-1].content)
+    assert analysis_prompt.count("/bin/false") >= 3
+
+
+@pytest.mark.integration
+async def test_agent_runtime_denies_without_execution(tmp_path: Path) -> None:
+    provider = _Provider([command_plan_json("/bin/echo denied")])
+    ui = _UI({"decision": "non_tty_auto_deny", "latency_ms": 0})
+    agent = _agent(tmp_path, provider=provider, ui=ui)
+
+    await agent.run_turn("say denied", thread_id="runtime-deny")
+
+    assert ui.interrupts[0]["command"] == "/bin/echo denied"
+    assert ui.printed == ["已拒绝执行：/bin/echo denied"]
+    audit_text = (tmp_path / "audit.log").read_text(encoding="utf-8")
+    assert "confirm_decision" in audit_text
+    assert "command_executed" not in audit_text
+
+
+@pytest.mark.integration
+async def test_agent_runtime_batch_confirm_executes_cluster_command(tmp_path: Path) -> None:
+    payload = json.loads(command_plan_json("/bin/echo cluster"))
+    payload["commands"][0]["target_hosts"] = ["*"]
+    provider = _Provider([json.dumps(payload), "cluster analysis"])
+    ui = _UI()
+    cluster_service = ClusterService(
+        ClusterConfig(
+            batch_confirm_threshold=2,
+            hosts=(
+                ClusterHost(name="a", hostname="a.invalid", username="ops"),
+                ClusterHost(
+                    name="b",
+                    hostname="b.invalid",
+                    username="ops",
+                    remote_profile=ClusterRemoteProfile(name="ops-clean", remote_cwd="/srv/app"),
+                ),
+            ),
+        ),
+        _FakeSSH(),  # type: ignore[arg-type]
+    )
+    agent = _agent(tmp_path, provider=provider, ui=ui, cluster_service=cluster_service)
+
+    await agent.run_turn("run echo on all hosts", thread_id="runtime-batch")
+
+    assert ui.interrupts[0]["batch_hosts"] == ["a", "b"]
+    assert ui.interrupts[0]["remote_profiles"][1]["profile"] == "ops-clean"
+    assert ui.interrupts[0]["remote_profiles"][1]["remote_cwd"] == "/srv/app"
+    assert ui.printed == ["cluster analysis"]
+    analysis_prompt = str(provider.complete_messages[-1][-1].content)
+    assert "a:/bin/echo cluster" in analysis_prompt
+    assert "b:/bin/echo cluster" in analysis_prompt
+
+
+def _agent(
+    tmp_path: Path,
+    *,
+    provider: _Provider,
+    ui: _UI,
+    cluster_service: ClusterService | None = None,
+    command_plan_config: CommandPlanConfig | None = None,
+    runtime_observer: Any | None = None,
+) -> LinuxAgent:
+    command_service = CommandService(
+        LinuxCommandExecutor(
+            SecurityConfig(command_timeout=5.0),
+            whitelist=SessionWhitelist(),
+        )
+    )
+    graph = build_agent_graph(
+        GraphDependencies(
+            provider=provider,  # type: ignore[arg-type]
+            command_service=command_service,
+            audit=AuditLog(tmp_path / "audit.log"),
+            cluster_service=cluster_service,
+            command_plan_config=command_plan_config or CommandPlanConfig(),
+            runtime_observer=runtime_observer,
+        )
+    )
+    return LinuxAgent(
+        graph_runtime=GraphRuntime(graph),
+        ui=ui,  # type: ignore[arg-type]
+        chat_service=ChatService(tmp_path / "history.json", max_messages=20),
+        command_service=command_service,
+        audit=AuditLog(tmp_path / "agent-audit.log"),
+        context_manager=ContextManager(20),
+        monitoring_service=_Monitoring(),  # type: ignore[arg-type]
+        cluster_service=cluster_service,
+    )

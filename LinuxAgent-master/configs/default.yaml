@@ -1,0 +1,186 @@
+# LinuxAgent v4 default configuration — packaged defaults.
+# DO NOT put real secrets here. User overrides live in ./config.yaml (gitignored, chmod 600).
+
+language: zh-CN
+
+api:
+  provider: deepseek          # openai | openai_compatible | local | ollama | vllm | lmstudio | deepseek | glm | qwen | kimi | minimax | gemini | hunyuan | anthropic | anthropic_compatible | xiaomi_mimo
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+  api_key: ""                 # MUST be set in user ./config.yaml
+  timeout: 30.0
+  stream_timeout: 60.0
+  max_retries: 3
+  temperature: 0.5
+  max_tokens: 2048
+  token_parameter: max_completion_tokens  # max_completion_tokens | max_tokens
+  prompt_cache: true        # send stable per-thread prompt_cache_key; auto-fallback if unsupported
+
+security:
+  command_timeout: 30.0
+  max_command_length: 2048
+  output_bytes: 65536              # total stdout+stderr capture budget for command context/UI
+  session_whitelist_enabled: true
+
+policy:
+  path:                         # optional user policy YAML path
+  include_builtin: true          # true = built-ins + user overrides; false = user rules only
+
+network:
+  enabled: false                 # optional fetch_url tool is disabled by default
+  default_action: deny           # allow | deny
+  allowed_domains: []
+  denied_domains: []
+  max_response_bytes: 1048576
+  timeout_seconds: 10.0
+
+command_plan:
+  max_repair_attempts: 2         # 0 disables automatic failed-command replanning
+  parallel_direct_answer_tasks: 8
+
+file_patch:
+  allow_roots:
+    - .
+    - /tmp
+  high_risk_roots:
+    - /etc
+    - /root/.ssh
+    - /home/*/.ssh
+  allow_permission_changes: true
+  max_repair_attempts: 2
+
+sandbox:
+  # Default compatibility mode: records sandbox metadata but does not isolate
+  # commands. Runtime records expose runtime_label=no_isolation unless an
+  # enabled runner can actually enforce a stronger boundary.
+  enabled: false
+  runner: noop                 # noop | local | bubblewrap
+  default_profile: system_inspect
+  allowed_roots:
+    - .
+    - /tmp
+  read_allow_paths:
+    - /var/log
+  read_hide_paths:
+    - /etc/shadow
+    - /etc/gshadow
+    - ~/.ssh
+    - ~/.aws
+    - ~/.kube
+    - ~/.config/gcloud
+  temp_dir: /tmp/linuxagent-sandbox
+  network: inherit
+  network_allowlist: []
+  limits:
+    cpu_seconds:
+    memory_mb:
+    process_count:
+    output_bytes:
+  tools:
+    enable_execute_command: false
+    max_rounds: 3
+    timeout_seconds: 5.0
+    max_output_chars: 20000
+    max_total_output_chars: 60000
+    max_file_bytes: 1048576
+    max_matches: 200
+
+cluster:
+  batch_confirm_threshold: 2
+  timeout: 60.0
+  max_workers: 8
+  known_hosts_path: ~/.ssh/known_hosts
+  hosts: []
+
+audit:
+  path: ~/.linuxagent/audit.log
+  sink_enabled: false
+  sink_url:
+  sink_timeout_seconds: 2.0
+  sink_header_name:
+  sink_header_value:
+
+mcp:
+  enabled: true
+  transport: stdio
+  tools:
+    - linuxagent.policy.classify
+    - linuxagent.audit.verify
+  resources:
+    - linuxagent://skills/summary
+    - linuxagent://memory/summary
+
+skills:
+  enabled: false
+  manifests: []
+
+memory:
+  # Local advisory memory is enabled by default. It writes only under
+  # ~/.linuxagent/memories and is never used for policy, HITL, sandbox,
+  # execution, or audit decisions.
+  enabled: true
+  path: ~/.linuxagent/memories
+  use_memories: true
+  generate_memories: true
+  disable_on_external_context: false
+  max_summary_chars: 12000
+  max_note_bytes: 20000
+  max_rollouts_per_startup: 2
+  max_rollout_age_days: 10
+  min_rollout_idle_hours: 6
+  min_rate_limit_remaining_percent: 25
+  max_raw_memories_for_consolidation: 256
+  max_unused_days: 30
+  extract_model:
+  consolidation_model:
+  stage1_message_limit: 12
+  pipeline_lock_ttl_seconds: 600
+
+ui:
+  theme: auto
+  tui_layout: wide
+  max_chat_history: 20
+  history_path: ~/.linuxagent/history.json
+  checkpoint_path: ~/.linuxagent/checkpoints.json
+  prompt_symbol: "❯"
+
+logging:
+  level: WARNING
+  format: console
+
+monitoring:
+  enabled: true
+  interval_seconds: 30.0
+  cpu_threshold: 90.0
+  memory_threshold: 90.0
+  disk_threshold: 90.0
+
+jobs:
+  daemon_enabled: true
+  max_history: 200
+  retention_days: 30
+
+telemetry:
+  enabled: true
+  exporter: local  # local | none | console | otlp
+  path: ~/.linuxagent/telemetry.jsonl
+  otlp_endpoint:
+
+analytics:
+  enabled: false
+  data_path: ~/.linuxagent/analytics.json
+
+log_analysis:
+  enabled: true
+  default_log_paths:
+    - /var/log/syslog
+    - /var/log/messages
+  max_lines: 10000
+
+intelligence:
+  enabled: true
+  tools_enabled: false
+  context_window: 50
+  embedding_model: text-embedding-3-small
+  embedding_cache_dir: ~/.cache/linuxagent/embeddings
+  default_command_candidates: []

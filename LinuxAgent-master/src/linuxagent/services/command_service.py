@@ -1,0 +1,118 @@
+"""Command service: safety classification plus guarded execution."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from ..interfaces import (
+    CommandExecutor,
+    CommandSource,
+    ExecutionResult,
+    OutputCallback,
+    SafetyLevel,
+    SafetyResult,
+)
+from ..usage_insights import CommandLearner
+
+
+@dataclass(frozen=True)
+class CommandRunResult:
+    safety: SafetyResult
+    execution: ExecutionResult
+
+
+class CommandSafetyError(RuntimeError):
+    def __init__(self, safety: SafetyResult) -> None:
+        super().__init__(safety.reason or safety.level.value)
+        self.safety = safety
+
+
+class CommandBlockedByPolicyError(CommandSafetyError):
+    """Command was classified BLOCK and must not execute."""
+
+
+class CommandConfirmationRequiredError(CommandSafetyError):
+    """Command requires HITL confirmation before execution."""
+
+
+class CommandService:
+    def __init__(
+        self,
+        executor: CommandExecutor,
+        learner: CommandLearner | None = None,
+    ) -> None:
+        self._executor = executor
+        self._learner = learner
+
+    def classify(
+        self,
+        command: str,
+        *,
+        source: CommandSource = CommandSource.USER,
+    ) -> SafetyResult:
+        return self._executor.is_safe(command, source=source)
+
+    def sandbox_preview(
+        self,
+        command: str,
+        *,
+        source: CommandSource = CommandSource.USER,
+    ) -> dict[str, object] | None:
+        preview = getattr(self._executor, "sandbox_preview", None)
+        if not callable(preview):
+            return None
+        result: Any = preview(command, source=source)
+        return result if isinstance(result, dict) else None
+
+    async def run(self, command: str) -> ExecutionResult:
+        result = await self._executor.execute(command)
+        self._record(command, result)
+        return result
+
+    async def run_interactive(self, command: str) -> ExecutionResult:
+        result = await self._executor.execute_interactive(command)
+        self._record(command, result)
+        return result
+
+    async def run_streaming(
+        self,
+        command: str,
+        *,
+        on_stdout: OutputCallback,
+        on_stderr: OutputCallback,
+        timeout_seconds: float | None = None,
+    ) -> ExecutionResult:
+        kwargs: dict[str, Any] = {"on_stdout": on_stdout, "on_stderr": on_stderr}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        result = await self._executor.execute_streaming(command, **kwargs)
+        self._record(command, result)
+        return result
+
+    async def run_checked(
+        self,
+        command: str,
+        *,
+        source: CommandSource = CommandSource.USER,
+    ) -> CommandRunResult:
+        safety = self.classify(command, source=source)
+        if safety.level is SafetyLevel.BLOCK:
+            raise CommandBlockedByPolicyError(safety)
+        if safety.level is SafetyLevel.CONFIRM:
+            raise CommandConfirmationRequiredError(safety)
+        execution = await self.run(command)
+        return CommandRunResult(safety=safety, execution=execution)
+
+    @property
+    def executor(self) -> CommandExecutor:
+        return self._executor
+
+    def _record(self, command: str, result: ExecutionResult) -> None:
+        if self._learner is None:
+            return
+        self._learner.record(command, result)
+        try:
+            self._learner.save()
+        except ValueError:
+            return

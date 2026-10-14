@@ -1,0 +1,652 @@
+"""Command-line entry point."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from uuid import uuid4
+
+from . import __version__
+from .audit import verify_audit_log
+from .audit_inspect import AuditInspectError, AuditInspection, inspect_audit_log
+from .config.loader import ConfigError, load_config
+from .config.models import AppConfig, McpConfig, NetworkConfig
+from .container import Container
+from .i18n import Translator, default_translator
+from .logger import configure_dependency_logging, configure_logging
+from .mcp_server import McpServer, serve_stdio
+from .memory import (
+    MemoryDisabledError,
+    MemoryStore,
+    format_memory_notes,
+    format_memory_status,
+    format_memory_suggestions,
+)
+from .memory.pipeline import (
+    MemoryPipelineLockedError,
+    run_memory_pipeline,
+    start_startup_pipeline_task,
+)
+from .memory.suggestions import suggest_from_history
+from .providers.errors import ProviderError
+from .services import MonitoringAlert, collect_system_snapshot, evaluate_alerts
+from .tools import format_tool_catalog_check
+
+logger = logging.getLogger(__name__)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _base_parser()
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"linuxagent {__version__}",
+    )
+    _add_global_options(parser)
+    _add_subcommands(parser)
+    return parser
+
+
+def _base_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        prog="linuxagent",
+        description=(
+            "LLM-driven Linux operations assistant with Human-in-the-Loop safety. "
+            "Run `linuxagent` to start chat or `linuxagent check` to validate your configuration."
+        ),
+    )
+
+
+def _add_global_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Path to a user config.yaml (must be chmod 0600 + owned by you). "
+            "Overrides LINUXAGENT_CONFIG."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase log verbosity (-v=INFO, -vv=DEBUG).",
+    )
+
+
+def _add_subcommands(parser: argparse.ArgumentParser) -> None:
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+    _add_simple_subcommands(subparsers)
+    _add_memory_subcommands(subparsers)
+    _add_audit_subcommands(subparsers)
+
+
+def _add_simple_subcommands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    subparsers.add_parser("check", help="Load + validate configuration and exit.")
+    subparsers.add_parser("chat", help="Start an interactive chat session (default).")
+    subparsers.add_parser("tui", help="Start chat with the wide terminal UI layout.")
+    subparsers.add_parser("mcp", help="Run the read-only stdio MCP server.")
+    subparsers.add_parser("job-daemon", help="Run the local background job supervisor.")
+
+
+def _add_memory_subcommands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Manage configurable local advisory memory.",
+    )
+    memory_subparsers = memory_parser.add_subparsers(
+        dest="memory_command",
+        metavar="MEMORY_COMMAND",
+    )
+    memory_subparsers.add_parser("status", help="Show memory status.")
+    memory_subparsers.add_parser("list", help="List manual memory notes.")
+    memory_subparsers.add_parser("pending", help="List pending memory suggestions.")
+    memory_subparsers.add_parser("summary", help="Print the memory summary used in prompts.")
+    memory_add = memory_subparsers.add_parser("add", help="Add an explicit manual memory note.")
+    memory_add.add_argument("text", nargs="+", help="Memory text to store after redaction.")
+    suggest_parser = memory_subparsers.add_parser(
+        "suggest",
+        help="Create a pending memory suggestion from saved chat history.",
+    )
+    suggest_parser.add_argument(
+        "--sessions",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of recent saved sessions to inspect.",
+    )
+    promote_parser = memory_subparsers.add_parser(
+        "promote",
+        help="Promote a pending memory suggestion by filename.",
+    )
+    promote_parser.add_argument("name", help="Pending suggestion filename from `memory pending`.")
+    memory_subparsers.add_parser(
+        "consolidate",
+        help="Run the locked two-stage local memory consolidation pipeline.",
+    )
+
+
+def _add_audit_subcommands(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Audit log utilities.",
+    )
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_command", metavar="AUDIT_COMMAND")
+    verify_parser = audit_subparsers.add_parser(
+        "verify",
+        help="Verify the audit hash chain.",
+    )
+    verify_parser.add_argument(
+        "--path",
+        type=Path,
+        metavar="PATH",
+        help="Audit log path. Defaults to audit.path from config.",
+    )
+    summary_parser = audit_subparsers.add_parser(
+        "summary",
+        help="Show a redacted audit summary.",
+    )
+    _add_audit_inspect_options(summary_parser)
+    inspect_parser = audit_subparsers.add_parser(
+        "inspect",
+        help="Show redacted audit diagnostics with recent command events.",
+    )
+    _add_audit_inspect_options(inspect_parser)
+    inspect_parser.add_argument(
+        "--show-commands",
+        action="store_true",
+        help="Show redacted command strings in recent command details.",
+    )
+
+
+def _verbose_to_level(verbose: int) -> int:
+    if verbose >= 2:
+        return logging.DEBUG
+    if verbose == 1:
+        return logging.INFO
+    return logging.WARNING
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    configure_logging(level=_verbose_to_level(args.verbose))
+    try:
+        cfg = load_config(cli_path=args.config)
+        container = Container(cfg, config_path=args.config)
+        skill_summary = _skill_summary(container)
+        tool_catalog = container.tool_catalog()
+    except (ConfigError, ValueError) as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    alerts = evaluate_alerts(collect_system_snapshot(), cfg.monitoring)
+    translator = container.translator()
+    alert_summary = (
+        translator.t("common.none")
+        if not alerts
+        else ", ".join(_format_alert(alert) for alert in alerts)
+    )
+    print(_format_check_summary(cfg, skill_summary, alert_summary, translator=translator))
+    print(
+        format_tool_catalog_check(
+            tool_catalog,
+            runner=cfg.sandbox.runner,
+            sandbox_enabled=cfg.sandbox.enabled,
+            translator=translator,
+        )
+    )
+    return 0 if tool_catalog.ok else 1
+
+
+def _cmd_chat(args: argparse.Namespace) -> int:
+    return _run_chat(args)
+
+
+def _cmd_tui(args: argparse.Namespace) -> int:
+    return _run_chat(args, tui_layout="wide")
+
+
+def _run_chat(args: argparse.Namespace, *, tui_layout: str | None = None) -> int:
+    try:
+        cfg = load_config(cli_path=args.config)
+        cfg.api.require_key()
+    except (ConfigError, ValueError) as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    cfg = _with_tui_layout(cfg, tui_layout)
+
+    level: int | str = _verbose_to_level(args.verbose) if args.verbose > 0 else cfg.logging.level
+    configure_logging(level=level, fmt=cfg.logging.format)
+    configure_dependency_logging(quiet=args.verbose == 0)
+
+    container = Container(cfg, config_path=args.config)
+    chat_service = container.chat_service()
+    chat_service.load()
+    memory_store = container.memory_store()
+    start_startup_pipeline_task(
+        memory_store,
+        chat_service,
+        provider=container.provider() if memory_store.config.enabled else None,
+    )
+    try:
+        asyncio.run(container.build_agent().run(thread_id=f"cli-{uuid4().hex}"))
+    except ProviderError as exc:
+        print(container.translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    finally:
+        chat_service.save()
+    return 0
+
+
+def _with_tui_layout(config: AppConfig, layout: str | None) -> AppConfig:
+    if layout is None:
+        return config
+    ui = config.ui.model_copy(update={"tui_layout": layout})
+    return config.model_copy(update={"ui": ui})
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    if args.audit_command is None:
+        print(default_translator().t("cli.audit.missing_subcommand"), file=sys.stderr)
+        return 2
+    try:
+        path, translator = _audit_path_and_translator(args)
+    except ConfigError as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    if args.audit_command in {"summary", "inspect"}:
+        return _cmd_audit_summary(args, path, translator)
+    result = verify_audit_log(path)
+    if result.valid:
+        print(translator.t("cli.audit.verify_ok", records=result.checked_records))
+        return 0
+    print(
+        translator.t("cli.audit.tamper", line=result.tampered_line, reason=result.reason),
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _audit_path_and_translator(args: argparse.Namespace) -> tuple[Path, Translator]:
+    try:
+        cfg = load_config(cli_path=args.config)
+    except ConfigError:
+        if args.path is None:
+            raise
+        return args.path, default_translator()
+    path = args.path if args.path is not None else cfg.audit.path
+    return path, Translator(cfg.language)
+
+
+def _add_audit_inspect_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--path",
+        type=Path,
+        metavar="PATH",
+        help="Audit log path. Defaults to audit.path from config.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Recent command event detail limit.",
+    )
+
+
+def _cmd_audit_summary(args: argparse.Namespace, path: Path, translator: Translator) -> int:
+    include_commands = bool(getattr(args, "show_commands", False))
+    try:
+        inspection = inspect_audit_log(
+            path,
+            include_commands=include_commands,
+            limit=args.limit,
+        )
+    except AuditInspectError as exc:
+        print(translator.t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    print(
+        _format_audit_inspection(
+            inspection, include_commands=include_commands, translator=translator
+        )
+    )
+    return 0 if inspection.verification.valid else 1
+
+
+def _format_audit_inspection(
+    inspection: AuditInspection,
+    *,
+    include_commands: bool,
+    translator: Translator | None = None,
+) -> str:
+    tr = translator or default_translator()
+    lines = [
+        tr.t("cli.audit.title", path=inspection.path),
+        _format_hash_status(inspection, translator=tr),
+        tr.t("cli.audit.records", count=inspection.total_records),
+        tr.t("cli.audit.time_range", range=_format_time_range(inspection, translator=tr)),
+        tr.t("cli.audit.command_decisions", count=inspection.command_decision_count),
+        tr.t("cli.audit.decisions", counts=_format_counts(inspection.decision_counts)),
+        tr.t("cli.audit.safety", counts=_format_counts(inspection.safety_counts)),
+        tr.t(
+            "cli.audit.command_events",
+            count=inspection.command_event_count,
+            sensitive=inspection.sensitive_command_event_count,
+        ),
+    ]
+    if inspection.details:
+        lines.append(tr.t("cli.audit.recent_commands"))
+        lines.extend(_format_audit_details(inspection, include_commands=include_commands))
+    return "\n".join(lines)
+
+
+def _format_audit_details(
+    inspection: AuditInspection,
+    *,
+    include_commands: bool,
+) -> list[str]:
+    lines: list[str] = []
+    for detail in inspection.details:
+        command_ref = detail.command or detail.command_hash
+        command_label = "command" if include_commands else "command_sha256"
+        fields = [
+            f"line={detail.line_no}",
+            f"event={detail.event}",
+            f"{command_label}={command_ref}",
+            f"sensitive={str(detail.sensitive).lower()}",
+        ]
+        if detail.safety_level:
+            fields.append(f"safety={detail.safety_level}")
+        if detail.decision:
+            fields.append(f"decision={detail.decision}")
+        if detail.exit_code is not None:
+            fields.append(f"exit_code={detail.exit_code}")
+        if detail.sensitive_sources:
+            fields.append(f"sources={','.join(detail.sensitive_sources)}")
+        lines.append(f"  - {' '.join(fields)}")
+    return lines
+
+
+def _format_hash_status(
+    inspection: AuditInspection, *, translator: Translator | None = None
+) -> str:
+    tr = translator or default_translator()
+    if inspection.verification.valid:
+        return tr.t("cli.audit.hash_valid", records=inspection.verification.checked_records)
+    return tr.t(
+        "cli.audit.hash_invalid",
+        line=inspection.verification.tampered_line,
+        reason=inspection.verification.reason,
+    )
+
+
+def _format_time_range(inspection: AuditInspection, *, translator: Translator | None = None) -> str:
+    tr = translator or default_translator()
+    if inspection.time_start is None and inspection.time_end is None:
+        return tr.t("cli.audit.time_empty")
+    return f"{inspection.time_start or '?'}..{inspection.time_end or '?'}"
+
+
+def _format_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in counts.items())
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(cli_path=args.config)
+    except ConfigError as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    if not cfg.mcp.enabled:
+        print(Translator(cfg.language).t("cli.mcp.disabled"), file=sys.stderr)
+        return 1
+    container = Container(cfg, config_path=args.config)
+    server = McpServer(
+        container.policy_engine(),
+        cfg.audit.path,
+        tools=cfg.mcp.tools,
+        resources=cfg.mcp.resources,
+        skills=container.skill_manifests(),
+        memory_store=container.memory_store(),
+    )
+    return serve_stdio(server)
+
+
+def _cmd_memory(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(cli_path=args.config)
+    except ConfigError as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    translator = Translator(cfg.language)
+    container = Container(cfg, config_path=args.config)
+    command = args.memory_command or "status"
+    simple = _memory_simple_commands(args, container, translator)
+    if command in simple:
+        return simple[command]()
+    print(translator.t("memory.usage"), file=sys.stderr)
+    return 2
+
+
+def _memory_simple_commands(
+    args: argparse.Namespace,
+    container: Container,
+    translator: Translator,
+) -> dict[str, Callable[[], int]]:
+    store = container.memory_store()
+    return {
+        "add": lambda: _cmd_memory_add(args, store, translator),
+        "consolidate": lambda: _cmd_memory_consolidate(container, store, translator),
+        "list": lambda: _print_memory_notes(store, translator),
+        "pending": lambda: _print_memory_pending(store, translator),
+        "promote": lambda: _cmd_memory_promote(args, store, translator),
+        "status": lambda: _print_memory_status(store, translator),
+        "suggest": lambda: _cmd_memory_suggest(args, container, store, translator),
+        "summary": lambda: _print_memory_summary(store, translator),
+    }
+
+
+def _print_memory_status(store: MemoryStore, translator: Translator) -> int:
+    print(format_memory_status(store.status(), translator=translator))
+    return 0
+
+
+def _print_memory_notes(store: MemoryStore, translator: Translator) -> int:
+    print(format_memory_notes(store.list_notes(), translator=translator))
+    return 0
+
+
+def _print_memory_pending(store: MemoryStore, translator: Translator) -> int:
+    print(format_memory_suggestions(store.list_suggestions(), translator=translator))
+    return 0
+
+
+def _print_memory_summary(store: MemoryStore, translator: Translator) -> int:
+    print(store.read_summary().strip() or translator.t("memory.summary_empty"))
+    return 0
+
+
+def _cmd_memory_suggest(
+    args: argparse.Namespace,
+    container: Container,
+    store: MemoryStore,
+    translator: Translator,
+) -> int:
+    chat_service = container.chat_service()
+    chat_service.load()
+    try:
+        suggestion_result = suggest_from_history(store, chat_service, session_limit=args.sessions)
+    except MemoryDisabledError:
+        print(translator.t("memory.disabled", path=store.root), file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(translator.t("memory.error", message=exc), file=sys.stderr)
+        return 1
+    if suggestion_result.suggestion is None:
+        print(translator.t("memory.suggest_none"))
+        return 0
+    print(
+        translator.t(
+            "memory.suggested",
+            path=suggestion_result.suggestion.path,
+            sessions=suggestion_result.session_count,
+        )
+    )
+    return 0
+
+
+def _cmd_memory_consolidate(
+    container: Container, store: MemoryStore, translator: Translator
+) -> int:
+    chat_service = container.chat_service()
+    chat_service.load()
+    try:
+        pipeline_result = run_memory_pipeline(store, chat_service, provider=container.provider())
+    except MemoryDisabledError:
+        print(translator.t("memory.disabled", path=store.root), file=sys.stderr)
+        return 1
+    except MemoryPipelineLockedError as exc:
+        print(translator.t("memory.error", message=exc), file=sys.stderr)
+        return 1
+    print(
+        translator.t(
+            "memory.consolidated",
+            records=pipeline_result.stage1_records,
+            path=store.summary_path,
+        )
+    )
+    return 0
+
+
+def _cmd_memory_promote(
+    args: argparse.Namespace, store: MemoryStore, translator: Translator
+) -> int:
+    try:
+        note = store.promote_suggestion(args.name)
+    except MemoryDisabledError:
+        print(translator.t("memory.disabled", path=store.root), file=sys.stderr)
+        return 1
+    except (FileNotFoundError, ValueError) as exc:
+        print(translator.t("memory.error", message=exc), file=sys.stderr)
+        return 1
+    print(translator.t("memory.promoted", path=note.path))
+    return 0
+
+
+def _cmd_memory_add(args: argparse.Namespace, store: MemoryStore, translator: Translator) -> int:
+    try:
+        note = store.add_note(" ".join(args.text))
+    except MemoryDisabledError:
+        print(translator.t("memory.disabled", path=store.root), file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(translator.t("memory.error", message=exc), file=sys.stderr)
+        return 1
+    print(translator.t("memory.added", path=note.path))
+    return 0
+
+
+def _cmd_job_daemon(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(cli_path=args.config)
+    except ConfigError as exc:
+        print(default_translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    level: int | str = _verbose_to_level(args.verbose) if args.verbose > 0 else cfg.logging.level
+    configure_logging(level=level, fmt=cfg.logging.format)
+    configure_dependency_logging(quiet=args.verbose == 0)
+    container = Container(cfg, config_path=args.config)
+    try:
+        asyncio.run(container.build_job_daemon().serve_forever())
+    except KeyboardInterrupt:
+        return 0
+    except RuntimeError as exc:
+        print(container.translator().t("cli.error", message=exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+_COMMANDS = {
+    "audit": _cmd_audit,
+    "check": _cmd_check,
+    "chat": _cmd_chat,
+    "job-daemon": _cmd_job_daemon,
+    "memory": _cmd_memory,
+    "mcp": _cmd_mcp,
+    "tui": _cmd_tui,
+}
+
+
+def _format_alert(alert: MonitoringAlert) -> str:
+    return f"{alert.severity}:{alert.metric}={alert.value:.1f}>={alert.threshold:.1f}"
+
+
+def _format_check_summary(
+    cfg: AppConfig,
+    skill_summary: str,
+    alert_summary: str,
+    *,
+    translator: Translator | None = None,
+) -> str:
+    tr = translator or default_translator()
+    return tr.t(
+        "cli.check.summary",
+        provider=cfg.api.provider,
+        model=cfg.api.model,
+        batch_confirm_threshold=cfg.cluster.batch_confirm_threshold,
+        audit_log=cfg.audit.path,
+        network=_network_summary(cfg.network, translator=tr),
+        mcp=_mcp_summary(cfg.mcp, translator=tr),
+        skills=skill_summary,
+        monitoring_alerts=alert_summary,
+    )
+
+
+def _network_summary(config: NetworkConfig, *, translator: Translator | None = None) -> str:
+    tr = translator or default_translator()
+    status = tr.t("common.enabled") if config.enabled else tr.t("common.disabled")
+    return (
+        f"{status}, default={config.default_action.value}, "
+        f"allow={len(config.allowed_domains)}, deny={len(config.denied_domains)}, "
+        f"max_bytes={config.max_response_bytes}, timeout={config.timeout_seconds:g}s"
+    )
+
+
+def _mcp_summary(config: McpConfig, *, translator: Translator | None = None) -> str:
+    tr = translator or default_translator()
+    if not config.enabled:
+        return tr.t("common.disabled")
+    if not config.tools:
+        return tr.t("common.none")
+    return ",".join(config.tools)
+
+
+def _skill_summary(container: Container) -> str:
+    if not container.config.skills.enabled:
+        return container.translator().t("cli.check.skills_disabled")
+    manifests = container.skill_manifests()
+    return container.translator().t(
+        "cli.check.skills_summary",
+        manifest_count=len(manifests),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args.command = "chat"
+    handler = _COMMANDS.get(args.command)
+    if handler is None:
+        parser.error(f"unknown command: {args.command}")
+    return handler(args)

@@ -1,0 +1,318 @@
+# LinuxAgent v4 example configuration.
+#
+# Copy this file to ./config.yaml (in the repo root) and `chmod 600 config.yaml`
+# before running LinuxAgent. The loader REJECTS any user-supplied config file
+# whose permissions are not 0600 or whose owner differs from the invoking user
+# (R-SEC-04).
+#
+# Bootstrap helper: `./scripts/bootstrap.sh` does the copy + chmod for you.
+#
+# Load priority (highest wins; same keys deep-merge):
+#   1. --config <path>                        (CLI flag)
+#   2. LINUXAGENT_CONFIG                      (env var, path only)
+#   3. ./config.yaml                          (cwd)
+#   4. ~/.config/linuxagent/config.yaml       (XDG)
+#   5. configs/default.yaml                   (packaged, lowest)
+#
+# Bootstrap exports LINUXAGENT_CONFIG=$HOME/.config/linuxagent/config.yaml so
+# the same user config is used when linuxagent starts from any working directory.
+
+# Runtime UI language for LinuxAgent-owned fixed text.
+# Supported: zh-CN | en-US
+language: zh-CN
+
+api:
+  # Provider: openai | openai_compatible | local | ollama | vllm | lmstudio | deepseek | glm | qwen | kimi | minimax | gemini | hunyuan | anthropic | anthropic_compatible | xiaomi_mimo
+  # Use *_compatible providers for API relays or third-party compatible endpoints.
+  provider: deepseek
+  # OpenAI-compatible endpoints include DeepSeek, Together, local Ollama, etc.
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+  # Put the real key here (SecretStr — never printed in repr/logs).
+  api_key: "sk-REPLACE-ME"
+  timeout: 30.0
+  stream_timeout: 60.0
+  max_retries: 3
+  temperature: 0.5
+  max_tokens: 2048
+  # Token limit parameter name. Some API relays and older OpenAI-compatible
+  # backends require max_tokens; newer OpenAI models use max_completion_tokens.
+  token_parameter: max_completion_tokens
+  # Send a stable per-thread prompt_cache_key. If a compatible relay rejects
+  # the parameter, LinuxAgent retries once without it and disables it in-memory.
+  prompt_cache: true
+
+  # Example API relay configuration:
+  # provider: openai_compatible
+  # base_url: https://relay.example.com/v1
+  # model: gpt-4o-mini
+  # api_key: "sk-REPLACE-ME"
+  # token_parameter: max_tokens
+
+  # Example local model configuration (OpenAI-compatible):
+  # provider: ollama
+  # base_url: http://127.0.0.1:11434/v1
+  # model: llama3.1
+  # api_key: ""                 # local providers do not require a real API key
+  # token_parameter: max_tokens
+  #
+  # Other local shortcuts:
+  # provider: vllm      base_url: http://127.0.0.1:8000/v1
+  # provider: lmstudio  base_url: http://127.0.0.1:1234/v1
+  # provider: local     base_url: http://127.0.0.1:8000/v1
+
+  # Example Anthropic-compatible relay configuration:
+  # provider: anthropic_compatible
+  # base_url: https://anthropic-relay.example.com
+  # model: claude-3-5-sonnet-latest
+  # api_key: "sk-ant-REPLACE-ME"
+
+  # Provider shortcuts using OpenAI-compatible protocols:
+  # GLM/Zhipu:       provider: glm      base_url: https://open.bigmodel.cn/api/paas/v4
+  # Qwen/DashScope:  provider: qwen     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # Kimi/Moonshot:   provider: kimi     base_url: https://api.moonshot.ai/v1
+  # MiniMax:         provider: minimax  base_url: https://api.minimax.io/v1
+  # Gemini:          provider: gemini   base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  # Hunyuan/Tencent: provider: hunyuan  base_url: https://api.hunyuan.cloud.tencent.com/v1
+  # Xiaomi MiMo uses Anthropic-compatible protocol:
+  # provider: xiaomi_mimo
+  # base_url: https://mimo-relay.example.com
+
+security:
+  command_timeout: 30.0
+  max_command_length: 2048
+  # Total stdout+stderr capture budget for command result panels and model context.
+  output_bytes: 65536
+  # Conversation permissions let you approve LLM-generated SAFE commands for
+  # the current conversation thread and the same thread after /resume.
+  # Destructive commands (R-HITL-03) are NEVER whitelisted, regardless of this flag.
+  session_whitelist_enabled: true
+
+policy:
+  # Optional path to a user policy YAML file. See configs/policy.default.yaml
+  # for the schema. Duplicate rule IDs override built-in rules; new IDs append.
+  path:
+  # Keep built-ins by default. Set false only when intentionally replacing the
+  # full policy set with user rules.
+  include_builtin: true
+
+network:
+  # Application-level policy for optional LLM/web network tools such as fetch_url. This is separate
+  # from sandbox.network, which describes OS execution isolation.
+  enabled: false
+  default_action: deny           # allow | deny
+  # Domain rules are case-insensitive and strip one trailing dot.
+  # Exact: example.com matches only example.com.
+  # Wildcard: .example.com or *.example.com matches subdomains only.
+  allowed_domains: []
+  denied_domains: []
+  max_response_bytes: 1048576
+  timeout_seconds: 10.0
+
+command_plan:
+  # Maximum number of automatic replanning rounds after a command plan fails.
+  # Set to 0 to disable failed-command repair fallback.
+  max_repair_attempts: 2
+  # Runtime budget for AI-decomposed conversational subtasks.
+  parallel_direct_answer_tasks: 8
+
+file_patch:
+  # FilePatchPlan can only write below these roots. Relative paths resolve from
+  # the current working directory when LinuxAgent starts.
+  allow_roots:
+    - .
+    - /tmp
+  # If a path is both allowed and high-risk, LinuxAgent shows a red elevated
+  # confirmation instead of a normal yellow confirmation.
+  high_risk_roots:
+    - /etc
+    - /root/.ssh
+    - /home/*/.ssh
+  # Permission changes are applied by Python after confirmation, never by shell.
+  allow_permission_changes: true
+  # Maximum number of automatic FilePatchPlan repair rounds before stopping.
+  # Set to 0 to disable patch repair fallback.
+  max_repair_attempts: 2
+
+sandbox:
+  # Default compatibility mode records metadata only: runtime_label=no_isolation.
+  # Use runner: local for process lifecycle controls
+  # (runtime_label=process_limits_only), or runner: bubblewrap when bwrap is
+  # installed and the requested profile can be enforced
+  # (runtime_label=filesystem_isolation).
+  enabled: false
+  runner: noop                 # noop | local | bubblewrap
+  default_profile: system_inspect  # none | read_only | system_inspect | workspace_write | privileged_passthrough
+  allowed_roots:
+    - .
+    - /tmp
+  # Extra read-only paths exposed for system inspection profiles.
+  read_allow_paths:
+    - /var/log
+  # Sensitive paths hidden inside read-only/system-inspect bubblewrap profiles.
+  read_hide_paths:
+    - /etc/shadow
+    - /etc/gshadow
+    - ~/.ssh
+    - ~/.aws
+    - ~/.kube
+    - ~/.config/gcloud
+  temp_dir: /tmp/linuxagent-sandbox
+  network: inherit                # inherit | disabled | loopback_only | allowlist
+  network_allowlist: []
+  limits:
+    cpu_seconds:
+    memory_mb:
+    process_count:
+    output_bytes:
+  tools:
+    # Keep the direct LLM-visible command execution tool disabled by default.
+    # Normal command execution should flow through the HITL graph.
+    enable_execute_command: false
+    max_rounds: 3
+    timeout_seconds: 5.0
+    max_output_chars: 20000
+    max_total_output_chars: 60000
+    max_file_bytes: 1048576
+    max_matches: 200
+
+cluster:
+  # Any command sent to >= this many hosts triggers R-HITL-02 batch confirm.
+  # The default of 2 catches even a tiny dev+prod pair by design.
+  batch_confirm_threshold: 2
+  timeout: 60.0
+  # Blocking Paramiko operations run on this manager-owned worker pool.
+  max_workers: 8
+  known_hosts_path: ~/.ssh/known_hosts
+  hosts: []
+  # Example:
+  # hosts:
+  #   - name: web-prod-1
+  #     hostname: 192.0.2.11
+  #     port: 22
+  #     username: ops
+  #     key_filename: ~/.ssh/id_ed25519
+  #     remote_profile:
+  #       name: ops-readonly
+  #       remote_cwd: /srv/app
+  #       environment: clean        # inherit | clean
+  #       allow_sudo: false
+  #       sudo_allowlist: []        # allow_sudo=true requires explicit commands
+
+audit:
+  # Audit log cannot be disabled (R-HITL-06). Path can change, presence cannot.
+  # File is hash-chained and created 0o600 on first write.
+  path: ~/.linuxagent/audit.log
+  # Optional best-effort HTTP sink. Local audit writes always happen first.
+  # Sink failures append audit_sink_failure locally and do not block execution.
+  sink_enabled: false
+  sink_url:
+  sink_timeout_seconds: 2.0
+  sink_header_name:
+  sink_header_value:
+
+mcp:
+  # Local stdio MCP server. Only read-only tools are supported in this slice.
+  enabled: true
+  transport: stdio
+  tools:
+    - linuxagent.policy.classify
+    - linuxagent.audit.verify
+  resources:
+    - linuxagent://skills/summary
+    - linuxagent://memory/summary
+
+skills:
+  # Declarative local YAML manifests only. No Python hooks, shell hooks, remote
+  # install, or execution bypass is supported.
+  enabled: false
+  manifests: []
+  # Example:
+  # enabled: true
+  # manifests:
+  #   - ./skills/disk-inspection.yaml
+
+memory:
+  # Local advisory memory is enabled by default. Manual notes are redacted and
+  # written under extensions/ad_hoc/notes. The summary may be injected into
+  # prompts, but never participates in policy, HITL, sandbox, execution, or
+  # audit decisions. Set enabled: false to disable all memory reads/writes.
+  enabled: true
+  path: ~/.linuxagent/memories
+  # Codex-aligned read/write split: use_memories controls prompt injection;
+  # generate_memories controls startup memory generation for new runs.
+  use_memories: true
+  generate_memories: true
+  disable_on_external_context: false
+  max_summary_chars: 12000
+  max_note_bytes: 20000
+  max_rollouts_per_startup: 2
+  max_rollout_age_days: 10
+  min_rollout_idle_hours: 6
+  min_rate_limit_remaining_percent: 25
+  max_raw_memories_for_consolidation: 256
+  max_unused_days: 30
+  extract_model:
+  consolidation_model:
+  stage1_message_limit: 12
+  pipeline_lock_ttl_seconds: 600
+
+telemetry:
+  # Default is local JSONL spans. Set exporter: console for local stdout
+  # development, otlp for an HTTP collector, or none to disable telemetry.
+  enabled: true
+  exporter: local              # local | none | console | otlp
+  path: ~/.linuxagent/telemetry.jsonl
+  otlp_endpoint:
+
+ui:
+  theme: auto                  # auto | light | dark
+  tui_layout: wide             # wide | compact
+  max_chat_history: 20
+  history_path: ~/.linuxagent/history.json
+  checkpoint_path: ~/.linuxagent/checkpoints.json
+  prompt_symbol: "❯"
+
+logging:
+  level: INFO                  # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  format: console              # console | json
+
+monitoring:
+  enabled: true
+  interval_seconds: 30.0
+  cpu_threshold: 90.0
+  memory_threshold: 90.0
+  disk_threshold: 90.0
+
+jobs:
+  # When true, approved background tasks are sent to a local Unix-socket
+  # supervisor so they can continue independently of the foreground chat loop.
+  daemon_enabled: true
+  # Finished job snapshots older than retention_days are pruned when jobs are persisted.
+  retention_days: 30
+  # Keep at most this many finished job snapshots after age-based pruning.
+  max_history: 200
+
+analytics:
+  enabled: false
+  data_path: ~/.linuxagent/analytics.json
+
+log_analysis:
+  enabled: true
+  default_log_paths:
+    - /var/log/syslog
+    - /var/log/messages
+  max_lines: 10000
+
+intelligence:
+  enabled: true
+  # Optional embedding-backed LLM tools. Keep disabled unless you explicitly
+  # want recommendations, knowledge search, and semantic command similarity.
+  tools_enabled: false
+  context_window: 50
+  # Embedding model used for semantic command/log search.
+  # MUST be an API-hosted model — local pytorch models are banned.
+  embedding_model: text-embedding-3-small
+  embedding_cache_dir: ~/.cache/linuxagent/embeddings
+  # Optional seed candidates used before learner memory has successful commands.
+  default_command_candidates: []

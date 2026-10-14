@@ -1,0 +1,116 @@
+"""Map policy capabilities to sandbox profiles."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Protocol
+
+from .models import SandboxProfile
+
+DEFAULT_READ_ALLOW_PATHS: tuple[Path, ...] = (Path("/var/log"),)
+DEFAULT_READ_HIDE_FILE_PATHS: frozenset[Path] = frozenset(
+    {
+        Path("/etc/shadow"),
+        Path("/etc/gshadow"),
+    }
+)
+DEFAULT_READ_HIDE_PATHS: tuple[Path, ...] = (
+    Path("/etc/shadow"),
+    Path("/etc/gshadow"),
+    Path("~/.ssh"),
+    Path("~/.aws"),
+    Path("~/.kube"),
+    Path("~/.config/gcloud"),
+)
+# Long-stable syscalls that any supported libseccomp must resolve. Failure to
+# resolve one is treated as fail-closed (see ``build_default_seccomp_program``)
+# rather than silently dropped. ``clone``/``clone3`` are intentionally absent:
+# they implement fork/thread creation and a blanket deny breaks every
+# subprocess inside the sandbox. Namespace creation is instead constrained by
+# bwrap's no-new-privs, the absence of CAP_SYS_ADMIN, and the ``unshare`` deny.
+SECCOMP_CRITICAL_DENY_SYSCALLS: frozenset[str] = frozenset(
+    {
+        "ptrace",
+        "mount",
+        "umount2",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "bpf",
+        "unshare",
+        "pivot_root",
+        "kexec_load",
+        "init_module",
+        "finit_module",
+    }
+)
+# Newer syscalls that reach the same effect as the critical set (the new mount
+# API and namespace join). Denied as defense-in-depth, but skipped without
+# failing when an older libseccomp cannot resolve the name.
+SECCOMP_MODERN_DENY_SYSCALLS: frozenset[str] = frozenset(
+    {
+        "setns",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "move_mount",
+        "open_tree",
+        "mount_setattr",
+    }
+)
+DEFAULT_SECCOMP_DENY_SYSCALLS: frozenset[str] = (
+    SECCOMP_CRITICAL_DENY_SYSCALLS | SECCOMP_MODERN_DENY_SYSCALLS
+)
+
+
+class _SafetyLike(Protocol):
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        """Policy capabilities used to choose a sandbox profile."""
+
+
+def profile_for_safety(
+    safety: _SafetyLike,
+    *,
+    default_profile: SandboxProfile = SandboxProfile.SYSTEM_INSPECT,
+) -> SandboxProfile:
+    if _has_capability_prefix(
+        safety.capabilities,
+        (
+            "filesystem.delete",
+            "filesystem.truncate",
+            "filesystem.mutate",
+            "filesystem.permission",
+            "filesystem.config_write",
+            "block_device.",
+            "service.mutate",
+            "package.remove",
+            "container.mutate",
+            "kubernetes.",
+            "network.firewall",
+            "identity.mutate",
+            "cron.mutate",
+            "privilege.sudo",
+        ),
+    ):
+        return SandboxProfile.PRIVILEGED_PASSTHROUGH
+    if _has_capability_prefix(
+        safety.capabilities,
+        (
+            "filesystem.write",
+            "filesystem.create",
+            "filesystem.patch",
+            "git.mutate",
+        ),
+    ):
+        return SandboxProfile.WORKSPACE_WRITE
+    if _has_capability_prefix(
+        safety.capabilities,
+        ("filesystem.read", "filesystem.sensitive_read", "system.inspect"),
+    ):
+        return SandboxProfile.READ_ONLY
+    return default_profile
+
+
+def _has_capability_prefix(capabilities: tuple[str, ...], prefixes: tuple[str, ...]) -> bool:
+    return any(capability.startswith(prefixes) for capability in capabilities)
