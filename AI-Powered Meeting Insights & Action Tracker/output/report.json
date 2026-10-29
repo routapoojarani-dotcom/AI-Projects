@@ -1,0 +1,68 @@
+{
+  "executive_summary": "The product team reviewed progress on the mobile app redesign, covering onboarding UI completion, auth endpoint and payment gateway integration timelines, and critical Android crash bugs found in QA. The team officially confirmed shifting the beta launch date from July 25 to August 5 to allow time for bug fixes and regression testing. Ownership was assigned for Android crash fixes and beta tester onboarding materials, with a follow-up check-in scheduled for July 20.",
+  "key_discussion_points": [
+    "Onboarding UI screens are complete and pushed to the staging branch.",
+    "Auth endpoints are targeted for completion by July 22nd.",
+    "Payment gateway integration will take about two more weeks after auth, finishing around early August.",
+    "QA found 12 bugs in the latest build, including 4 critical Android 12 crashes in the payment flow.",
+    "Beta launch date was officially moved from July 25th to August 5th."
+  ],
+  "action_items": [
+    {
+      "task": "Finalize auth endpoints",
+      "owner": "Bilal",
+      "deadline": "July 22, 2026"
+    },
+    {
+      "task": "Send crash logs for Android payment flow bugs",
+      "owner": "Usman",
+      "deadline": "Same day (July 10, 2026)"
+    },
+    {
+      "task": "Fix critical Android 12 crash issues",
+      "owner": "Ali (assigned by Bilal)",
+      "deadline": "July 18, 2026"
+    },
+    {
+      "task": "Prepare beta tester onboarding email and TestFlight/Play Store instructions",
+      "owner": "Sara",
+      "deadline": "July 24, 2026"
+    },
+    {
+      "task": "Prepare bug triage report",
+      "owner": "Usman",
+      "deadline": "Before July 20, 2026 meeting"
+    }
+  ],
+  "decisions_made": [
+    "Beta launch date officially moved from July 25th to August 5th.",
+    "Android crash fixes prioritized above all other work before beta release."
+  ],
+  "deadlines": [
+    {
+      "item": "Auth endpoints completion",
+      "date": "July 22, 2026"
+    },
+    {
+      "item": "Android crash fix",
+      "date": "July 18, 2026"
+    },
+    {
+      "item": "Beta tester onboarding instructions",
+      "date": "July 24, 2026"
+    },
+    {
+      "item": "Payment gateway integration",
+      "date": "Early August 2026"
+    },
+    {
+      "item": "Beta launch",
+      "date": "August 5, 2026"
+    }
+  ],
+  "next_steps": [
+    "Hold a follow-up meeting on July 20th to review auth endpoint and Android fix progress.",
+    "Usman to bring a bug triage report to the follow-up meeting.",
+    "Sara to hook up the login flow once auth endpoints are ready."
+  ]
+}

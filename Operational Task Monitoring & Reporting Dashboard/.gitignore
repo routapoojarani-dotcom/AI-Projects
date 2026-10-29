@@ -1,0 +1,25 @@
+# Virtual Environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data files
+tasks.json
+*.csv
+
+# Streamlit
+.streamlit/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

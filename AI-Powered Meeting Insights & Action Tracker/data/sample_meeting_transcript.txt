@@ -1,0 +1,47 @@
+Project Sync Meeting - Product Team
+Date: July 10, 2026
+Attendees: Ayesha (Product Manager), Bilal (Backend Lead), Sara (Frontend Lead), Usman (QA Lead)
+
+Ayesha: Good morning everyone. Let's start with a quick update on the mobile app redesign.
+Sara has finished the new onboarding screens, and Bilal's team is working on the API
+integration for the payment gateway.
+
+Sara: Yes, the onboarding UI is done and pushed to the staging branch. I need Bilal's
+team to finalize the auth endpoints by next Wednesday so I can hook up the login flow.
+
+Bilal: We're close. The auth endpoints should be ready by Wednesday, July 22nd. Payment
+gateway integration will take a bit longer, probably another two weeks after that,
+so end of first week of August.
+
+Usman: On the QA side, we found 12 bugs in the last build, 4 of them are critical and
+related to the payment flow crashing on Android 12 devices. I'll send Bilal the crash
+logs today.
+
+Ayesha: Okay, Bilal please prioritize those Android crash fixes before anything else,
+this is blocking our beta release.
+
+Bilal: Understood, I'll assign Ali to fix the Android crash issues starting tomorrow,
+target fix by July 18th.
+
+Ayesha: Great. Also, we decided in last week's meeting to move the beta launch date
+from July 25th to August 5th to accommodate these fixes. Let's confirm that officially
+today - everyone agree?
+
+Sara: Agreed, that gives us enough buffer.
+
+Usman: Agreed, that also gives QA more time for regression testing.
+
+Bilal: Agreed.
+
+Ayesha: Perfect, so beta launch is officially August 5th. One more thing - we need
+someone to prepare the beta tester onboarding email and TestFlight/Play Store beta
+instructions. Sara, can you own that?
+
+Sara: Sure, I'll have the beta instructions ready by July 24th.
+
+Ayesha: Awesome. Let's also plan a follow-up meeting next Monday, July 20th, to check
+progress on the auth endpoints and Android fixes.
+
+Usman: Sounds good. I'll also prepare a bug triage report before that meeting.
+
+Ayesha: Perfect, thanks everyone. Meeting adjourned.
